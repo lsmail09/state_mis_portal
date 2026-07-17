@@ -6,34 +6,20 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import URL
 import os
 from datetime import datetime
+import io
 
 # ============================================================
 # POSTGRES CONFIG
 # ============================================================
 
-# PG_HOST = "102.164.37.69"
-# PG_PORT = 5432
-# PG_DATABASE = "ben_db"
-# PG_USER = "ben_user"
-# PG_PASSWORD = "Olajumokepsgr@9@9"
-# PG_SCHEMA = "ben"
-#
-# engine = create_engine(
-#     f"postgresql+psycopg2://{PG_USER}:{PG_PASSWORD}@{PG_HOST}:{PG_PORT}/{PG_DATABASE}",
-#     pool_pre_ping=True
-# )
-#
+
 st.set_page_config(
     page_title="NCTO State Officer Portal",
     page_icon="🔐",
     layout="wide"
 )
 
-# PG_HOST = "102.164.37.69"
-# PG_PORT = 5432
-# PG_DATABASE = "your_database"
-# PG_USER = "your_username"
-# PG_PASSWORD = "9@9"   # example, keep your real password here
+
 
 PG_HOST = "102.164.37.69"
 PG_PORT = 5432
@@ -101,61 +87,70 @@ def authenticate_user(username, password):
 # DATA QUERY
 # ============================================================
 
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def load_state_summary(state_name):
     query = text("""
         WITH unified_payments AS
         (
-            SELECT 
+            SELECT
                 'First Tranche' AS tranche,
-                "State" AS state,
-                "LGA" AS lga,
-                "Ward" AS ward,
-                "Community" AS community,
-                nidhh,
-                nid
+                ben.normalize_location_name("State") AS state,
+                ben.normalize_location_name("LGA") AS lga,
+                ben.normalize_location_name("Ward") AS ward,
+                ben.normalize_location_name("Community") AS community,
+                CAST(nidhh AS TEXT) AS nidhh
             FROM ben."itblDistinctPaidBeneficiaries"
 
             UNION ALL
 
-            SELECT 
+            SELECT
                 'Second Tranche' AS tranche,
-                "State" AS state,
-                "LGA" AS lga,
-                "Ward" AS ward,
-                "Community" AS community,
-                nidhh,
-                nid
+                ben.normalize_location_name("State") AS state,
+                ben.normalize_location_name("LGA") AS lga,
+                ben.normalize_location_name("Ward") AS ward,
+                ben.normalize_location_name("Community") AS community,
+                CAST(nidhh AS TEXT) AS nidhh
             FROM ben."itblDistinctSecondTranche"
 
             UNION ALL
 
-            SELECT 
+            SELECT
                 'Third Tranche' AS tranche,
-                "State" AS state,
-                "LGA" AS lga,
-                "Ward" AS ward,
-                "Community" AS community,
-                nidhh,
-                nid
+                ben.normalize_location_name("State") AS state,
+                ben.normalize_location_name("LGA") AS lga,
+                ben.normalize_location_name("Ward") AS ward,
+                ben.normalize_location_name("Community") AS community,
+                CAST(nidhh AS TEXT) AS nidhh
             FROM ben."itblDistinctThirdTranche"
         )
         SELECT
             tranche,
             state,
             COUNT(DISTINCT nidhh) AS total_households,
-            COUNT(DISTINCT nid) AS total_beneficiaries,
+            COUNT(DISTINCT nidhh) AS total_beneficiaries,
             COUNT(DISTINCT lga) AS total_lgas,
-            COUNT(DISTINCT ward) AS total_wards,
-            COUNT(DISTINCT community) AS total_communities
+            COUNT(DISTINCT (lga, ward)) AS total_wards,
+            COUNT(DISTINCT (lga, ward, community)) AS total_communities
         FROM unified_payments
-        WHERE lower(state) = lower(:state_name)
+        WHERE state = ben.normalize_location_name(:state_name)
         GROUP BY tranche, state
-        ORDER BY tranche;
+        ORDER BY
+            CASE tranche
+                WHEN 'First Tranche' THEN 1
+                WHEN 'Second Tranche' THEN 2
+                WHEN 'Third Tranche' THEN 3
+                ELSE 4
+            END;
     """)
 
     with engine.connect() as conn:
-        return pd.read_sql(query, conn, params={"state_name": state_name})
+        return pd.read_sql(
+            query,
+            conn,
+            params={"state_name": state_name}
+        )
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -189,10 +184,14 @@ def load_state_data(state_name, tranche_filter, search_value, limit_rows):
         (
             SELECT
                 'First Tranche' AS tranche,
-                CAST("State" AS TEXT) AS "State",
-                CAST("LGA" AS TEXT) AS "LGA",
-                CAST("Ward" AS TEXT) AS "Ward",
-                CAST("Community" AS TEXT) AS "Community",
+                CAST("State" AS TEXT) AS "OriginalState",
+                CAST("LGA" AS TEXT) AS "OriginalLGA",
+                CAST("Ward" AS TEXT) AS "OriginalWard",
+                CAST("Community" AS TEXT) AS "OriginalCommunity",
+                ben.normalize_location_name("State") AS "CleanedState",
+                ben.normalize_location_name("LGA") AS "CleanedLGA",
+                ben.normalize_location_name("Ward") AS "CleanedWard",
+                ben.normalize_location_name("Community") AS "CleanedCommunity",
                 CAST("HouseholdID" AS TEXT) AS "HouseholdID",
                 CAST(nidhh AS TEXT) AS nidhh,
                 CAST(nid AS TEXT) AS nid,
@@ -223,10 +222,14 @@ def load_state_data(state_name, tranche_filter, search_value, limit_rows):
 
             SELECT
                 'Second Tranche' AS tranche,
-                CAST("State" AS TEXT) AS "State",
-                CAST("LGA" AS TEXT) AS "LGA",
-                CAST("Ward" AS TEXT) AS "Ward",
-                CAST("Community" AS TEXT) AS "Community",
+                CAST("State" AS TEXT) AS "OriginalState",
+                CAST("LGA" AS TEXT) AS "OriginalLGA",
+                CAST("Ward" AS TEXT) AS "OriginalWard",
+                CAST("Community" AS TEXT) AS "OriginalCommunity",
+                ben.normalize_location_name("State") AS "CleanedState",
+                ben.normalize_location_name("LGA") AS "CleanedLGA",
+                ben.normalize_location_name("Ward") AS "CleanedWard",
+                ben.normalize_location_name("Community") AS "CleanedCommunity",
                 CAST("HouseholdID" AS TEXT) AS "HouseholdID",
                 CAST(nidhh AS TEXT) AS nidhh,
                 CAST(nid AS TEXT) AS nid,
@@ -257,10 +260,14 @@ def load_state_data(state_name, tranche_filter, search_value, limit_rows):
 
             SELECT
                 'Third Tranche' AS tranche,
-                CAST("State" AS TEXT) AS "State",
-                CAST("LGA" AS TEXT) AS "LGA",
-                CAST("Ward" AS TEXT) AS "Ward",
-                CAST("Community" AS TEXT) AS "Community",
+                CAST("State" AS TEXT) AS "OriginalState",
+                CAST("LGA" AS TEXT) AS "OriginalLGA",
+                CAST("Ward" AS TEXT) AS "OriginalWard",
+                CAST("Community" AS TEXT) AS "OriginalCommunity",
+                ben.normalize_location_name("State") AS "CleanedState",
+                ben.normalize_location_name("LGA") AS "CleanedLGA",
+                ben.normalize_location_name("Ward") AS "CleanedWard",
+                ben.normalize_location_name("Community") AS "CleanedCommunity",
                 CAST("HouseholdID" AS TEXT) AS "HouseholdID",
                 CAST(nidhh AS TEXT) AS nidhh,
                 CAST(nid AS TEXT) AS nid,
@@ -289,7 +296,8 @@ def load_state_data(state_name, tranche_filter, search_value, limit_rows):
         )
         SELECT *
         FROM unified_payments
-        WHERE lower("State") = lower(:state_name)
+        WHERE "State" = ben.normalize_location_name(:state_name)
+        
         {tranche_condition}
         {search_condition}
         ORDER BY tranche, "LGA", "Ward", "Community"
@@ -300,184 +308,92 @@ def load_state_data(state_name, tranche_filter, search_value, limit_rows):
         return pd.read_sql(query, conn, params=params)
 
 
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def load_lga_summary(state_name):
     query = text("""
         WITH unified_payments AS
         (
-            SELECT 'First Tranche' AS tranche, "State" AS state, "LGA" AS lga, nidhh, nid
+            SELECT
+                'First Tranche' AS tranche,
+                ben.normalize_location_name("State") AS state,
+                ben.normalize_location_name("LGA") AS lga,
+                ben.normalize_location_name("Ward") AS ward,
+                ben.normalize_location_name("Community") AS community,
+                CAST(nidhh AS TEXT) AS nidhh
             FROM ben."itblDistinctPaidBeneficiaries"
 
             UNION ALL
 
-            SELECT 'Second Tranche' AS tranche, "State" AS state, "LGA" AS lga, nidhh, nid
+            SELECT
+                'Second Tranche' AS tranche,
+                ben.normalize_location_name("State") AS state,
+                ben.normalize_location_name("LGA") AS lga,
+                ben.normalize_location_name("Ward") AS ward,
+                ben.normalize_location_name("Community") AS community,
+                CAST(nidhh AS TEXT) AS nidhh
             FROM ben."itblDistinctSecondTranche"
 
             UNION ALL
 
-            SELECT 'Third Tranche' AS tranche, "State" AS state, "LGA" AS lga, nidhh, nid
+            SELECT
+                'Third Tranche' AS tranche,
+                ben.normalize_location_name("State") AS state,
+                ben.normalize_location_name("LGA") AS lga,
+                ben.normalize_location_name("Ward") AS ward,
+                ben.normalize_location_name("Community") AS community,
+                CAST(nidhh AS TEXT) AS nidhh
             FROM ben."itblDistinctThirdTranche"
         )
         SELECT
-            lga AS "LGA",
-            COUNT(DISTINCT CASE WHEN tranche = 'First Tranche' THEN nidhh END) AS "First_Tranche_HHs",
-            COUNT(DISTINCT CASE WHEN tranche = 'First Tranche' THEN nid END) AS "First_Tranche_Beneficiaries",
+            COALESCE(lga, 'UNKNOWN LGA') AS "LGA",
 
-            COUNT(DISTINCT CASE WHEN tranche = 'Second Tranche' THEN nidhh END) AS "Second_Tranche_HHs",
-            COUNT(DISTINCT CASE WHEN tranche = 'Second Tranche' THEN nid END) AS "Second_Tranche_Beneficiaries",
+            COUNT(DISTINCT CASE
+                WHEN tranche = 'First Tranche' THEN nidhh
+            END) AS "First_Tranche_Beneficiaries",
 
-            COUNT(DISTINCT CASE WHEN tranche = 'Third Tranche' THEN nidhh END) AS "Third_Tranche_HHs",
-            COUNT(DISTINCT CASE WHEN tranche = 'Third Tranche' THEN nid END) AS "Third_Tranche_Beneficiaries",
+            COUNT(DISTINCT CASE
+                WHEN tranche = 'Second Tranche' THEN nidhh
+            END) AS "Second_Tranche_Beneficiaries",
 
-            COUNT(DISTINCT nidhh) AS "Total_Unique_HHs",
-            COUNT(DISTINCT nid) AS "Total_Unique_Beneficiaries"
+            COUNT(DISTINCT CASE
+                WHEN tranche = 'Third Tranche' THEN nidhh
+            END) AS "Third_Tranche_Beneficiaries",
+
+            COUNT(DISTINCT nidhh)
+                AS "Total_Unique_Beneficiaries",
+
+            COUNT(DISTINCT ward)
+                FILTER (WHERE ward IS NOT NULL)
+                AS "Total_Wards",
+
+            COUNT(DISTINCT (ward, community))
+                FILTER (
+                    WHERE ward IS NOT NULL
+                      AND community IS NOT NULL
+                )
+                AS "Total_Communities"
+
         FROM unified_payments
-        WHERE lower(state) = lower(:state_name)
+        WHERE state = ben.normalize_location_name(:state_name)
         GROUP BY lga
-        ORDER BY lga;
+        ORDER BY COALESCE(lga, 'UNKNOWN LGA');
     """)
 
     with engine.connect() as conn:
-        return pd.read_sql(query, conn, params={"state_name": state_name})
-
-
-# def export_state_beneficiaries_csv(state_name, output_folder="exports", chunk_size=100000):
-#     os.makedirs(output_folder, exist_ok=True)
-#
-#     safe_state = str(state_name).replace("/", "_").replace("\\", "_").replace(" ", "_")
-#     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-#
-#     output_file = os.path.join(
-#         output_folder,
-#         f"{safe_state}_Beneficiaries_Details_{timestamp}.csv"
-#     )
-#
-#     query = text("""
-#         WITH unified_payments AS
-#         (
-#             SELECT
-#                 'First Tranche' AS tranche,
-#                 CAST("State" AS TEXT) AS "State",
-#                 CAST("LGA" AS TEXT) AS "LGA",
-#                 CAST("Ward" AS TEXT) AS "Ward",
-#                 CAST("Community" AS TEXT) AS "Community",
-#                 CAST("HouseholdID" AS TEXT) AS "HouseholdID",
-#                 CAST(nidhh AS TEXT) AS nidhh,
-#                 CAST(nid AS TEXT) AS nid,
-#                 CAST("Name" AS TEXT) AS "Name",
-#                 CAST("TelephoneNo" AS TEXT) AS "TelephoneNo",
-#                 CAST("Gender" AS TEXT) AS "Gender",
-#                 CAST("Age" AS TEXT) AS "Age",
-#                 CAST("AccountName" AS TEXT) AS "AccountName",
-#                 CAST("AccountNumber" AS TEXT) AS "AccountNumber",
-#                 CAST("BankName" AS TEXT) AS "BankName",
-#                 CAST("AmountPaid" AS TEXT) AS "AmountPaid",
-#                 CAST("PaymentStatus" AS TEXT) AS "PaymentStatus",
-#                 CAST("PaymentDate" AS TEXT) AS "PaymentDate",
-#                 CAST("NIN" AS TEXT) AS "NIN",
-#                 CAST("NINBVN" AS TEXT) AS "NINBVN",
-#                 CAST("IDType" AS TEXT) AS "IDType",
-#                 CAST("TrancheStatus" AS TEXT) AS "TrancheStatus",
-#                 CAST("TotalAmount" AS TEXT) AS "TotalAmount",
-#                 CAST("AccountUsed" AS TEXT) AS "AccountUsed",
-#                 CAST("Zone" AS TEXT) AS "Zone",
-#                 CAST("ward_class" AS TEXT) AS "ward_class"
-#             FROM ben."itblDistinctPaidBeneficiaries"
-#
-#             UNION ALL
-#
-#             SELECT
-#                 'Second Tranche' AS tranche,
-#                 CAST("State" AS TEXT),
-#                 CAST("LGA" AS TEXT),
-#                 CAST("Ward" AS TEXT),
-#                 CAST("Community" AS TEXT),
-#                 CAST("HouseholdID" AS TEXT),
-#                 CAST(nidhh AS TEXT),
-#                 CAST(nid AS TEXT),
-#                 CAST("Name" AS TEXT),
-#                 CAST("TelephoneNo" AS TEXT),
-#                 CAST("Gender" AS TEXT),
-#                 CAST("Age" AS TEXT),
-#                 CAST("AccountName" AS TEXT),
-#                 CAST("AccountNumber" AS TEXT),
-#                 CAST("BankName" AS TEXT),
-#                 CAST("AmountPaid" AS TEXT),
-#                 CAST("PaymentStatus" AS TEXT),
-#                 CAST("PaymentDate" AS TEXT),
-#                 CAST("NIN" AS TEXT),
-#                 CAST("NINBVN" AS TEXT),
-#                 CAST("IDType" AS TEXT),
-#                 CAST("TrancheStatus" AS TEXT),
-#                 CAST("TotalAmount" AS TEXT),
-#                 CAST("AccountUsed" AS TEXT),
-#                 CAST("Zone" AS TEXT),
-#                 CAST("ward_class" AS TEXT)
-#             FROM ben."itblDistinctSecondTranche"
-#
-#             UNION ALL
-#
-#             SELECT
-#                 'Third Tranche' AS tranche,
-#                 CAST("State" AS TEXT),
-#                 CAST("LGA" AS TEXT),
-#                 CAST("Ward" AS TEXT),
-#                 CAST("Community" AS TEXT),
-#                 CAST("HouseholdID" AS TEXT),
-#                 CAST(nidhh AS TEXT),
-#                 CAST(nid AS TEXT),
-#                 CAST("Name" AS TEXT),
-#                 CAST("TelephoneNo" AS TEXT),
-#                 CAST("Gender" AS TEXT),
-#                 CAST("Age" AS TEXT),
-#                 CAST("AccountName" AS TEXT),
-#                 CAST("AccountNumber" AS TEXT),
-#                 CAST("BankName" AS TEXT),
-#                 CAST("AmountPaid" AS TEXT),
-#                 CAST("PaymentStatus" AS TEXT),
-#                 CAST("PaymentDate" AS TEXT),
-#                 CAST("NIN" AS TEXT),
-#                 CAST("NINBVN" AS TEXT),
-#                 CAST("IDType" AS TEXT),
-#                 CAST("TrancheStatus" AS TEXT),
-#                 CAST("TotalAmount" AS TEXT),
-#                 CAST("AccountUsed" AS TEXT),
-#                 CAST("Zone" AS TEXT),
-#                 CAST("ward_class" AS TEXT)
-#             FROM ben."itblDistinctThirdTranche"
-#         )
-#         SELECT *
-#         FROM unified_payments
-#         WHERE lower("State") = lower(:state_name)
-#         ORDER BY tranche, "LGA", "Ward", "Community";
-#     """)
-#
-#     first_chunk = True
-#     total_rows = 0
-#
-#     with engine.connect().execution_options(stream_results=True) as conn:
-#         for chunk in pd.read_sql(
-#                 query,
-#                 conn,
-#                 params={"state_name": state_name},
-#                 chunksize=chunk_size
-#         ):
-#             chunk.to_csv(
-#                 output_file,
-#                 mode="w" if first_chunk else "a",
-#                 index=False,
-#                 header=first_chunk,
-#                 encoding="utf-8-sig"
-#             )
-#
-#             total_rows += len(chunk)
-#             first_chunk = False
-#
-#     return output_file, total_rows
+        return pd.read_sql(
+            query,
+            conn,
+            params={"state_name": state_name}
+        )
 
 
 
-import io
+
+
+
+
 
 def export_state_beneficiaries_csv(state_name, chunk_size=100000):
     query = text("""
@@ -496,18 +412,15 @@ def export_state_beneficiaries_csv(state_name, chunk_size=100000):
                 CAST("TelephoneNo" AS TEXT) AS "TelephoneNo",
                 CAST("Gender" AS TEXT) AS "Gender",
                 CAST("Age" AS TEXT) AS "Age",
+                CAST("HAddress" AS TEXT) AS "HAddress",
                 CAST("AccountName" AS TEXT) AS "AccountName",
                 CAST("AccountNumber" AS TEXT) AS "AccountNumber",
                 CAST("BankName" AS TEXT) AS "BankName",
                 CAST("AmountPaid" AS TEXT) AS "AmountPaid",
                 CAST("PaymentStatus" AS TEXT) AS "PaymentStatus",
                 CAST("PaymentDate" AS TEXT) AS "PaymentDate",
-                CAST("NIN" AS TEXT) AS "NIN",
-                CAST("NINBVN" AS TEXT) AS "NINBVN",
-                CAST("IDType" AS TEXT) AS "IDType",
                 CAST("TrancheStatus" AS TEXT) AS "TrancheStatus",
                 CAST("TotalAmount" AS TEXT) AS "TotalAmount",
-                CAST("AccountUsed" AS TEXT) AS "AccountUsed",
                 CAST("Zone" AS TEXT) AS "Zone",
                 CAST("ward_class" AS TEXT) AS "ward_class"
             FROM ben."itblDistinctPaidBeneficiaries"
@@ -516,17 +429,27 @@ def export_state_beneficiaries_csv(state_name, chunk_size=100000):
 
             SELECT
                 'Second Tranche' AS tranche,
-                CAST("State" AS TEXT), CAST("LGA" AS TEXT), CAST("Ward" AS TEXT),
-                CAST("Community" AS TEXT), CAST("HouseholdID" AS TEXT),
-                CAST(nidhh AS TEXT), CAST(nid AS TEXT), CAST("Name" AS TEXT),
-                CAST("TelephoneNo" AS TEXT), CAST("Gender" AS TEXT),
-                CAST("Age" AS TEXT), CAST("AccountName" AS TEXT),
-                CAST("AccountNumber" AS TEXT), CAST("BankName" AS TEXT),
-                CAST("AmountPaid" AS TEXT), CAST("PaymentStatus" AS TEXT),
-                CAST("PaymentDate" AS TEXT), CAST("NIN" AS TEXT),
-                CAST("NINBVN" AS TEXT), CAST("IDType" AS TEXT),
-                CAST("TrancheStatus" AS TEXT), CAST("TotalAmount" AS TEXT),
-                CAST("AccountUsed" AS TEXT), CAST("Zone" AS TEXT),
+                CAST("State" AS TEXT), 
+                CAST("LGA" AS TEXT), 
+                CAST("Ward" AS TEXT),
+                CAST("Community" AS TEXT), 
+                CAST("HouseholdID" AS TEXT),
+                CAST(nidhh AS TEXT), 
+                CAST(nid AS TEXT), 
+                CAST("Name" AS TEXT),
+                CAST("TelephoneNo" AS TEXT), 
+                CAST("Gender" AS TEXT),
+                CAST("Age" AS TEXT), 
+                CAST("HAddress" AS TEXT) AS "HAddress",
+                CAST("AccountName" AS TEXT),
+                CAST("AccountNumber" AS TEXT), 
+                CAST("BankName" AS TEXT),
+                CAST("AmountPaid" AS TEXT), 
+                CAST("PaymentStatus" AS TEXT),
+                CAST("PaymentDate" AS TEXT), 
+                CAST("TrancheStatus" AS TEXT), 
+                CAST("TotalAmount" AS TEXT),
+                CAST("Zone" AS TEXT),
                 CAST("ward_class" AS TEXT)
             FROM ben."itblDistinctSecondTranche"
 
@@ -534,17 +457,26 @@ def export_state_beneficiaries_csv(state_name, chunk_size=100000):
 
             SELECT
                 'Third Tranche' AS tranche,
-                CAST("State" AS TEXT), CAST("LGA" AS TEXT), CAST("Ward" AS TEXT),
-                CAST("Community" AS TEXT), CAST("HouseholdID" AS TEXT),
-                CAST(nidhh AS TEXT), CAST(nid AS TEXT), CAST("Name" AS TEXT),
-                CAST("TelephoneNo" AS TEXT), CAST("Gender" AS TEXT),
-                CAST("Age" AS TEXT), CAST("AccountName" AS TEXT),
-                CAST("AccountNumber" AS TEXT), CAST("BankName" AS TEXT),
-                CAST("AmountPaid" AS TEXT), CAST("PaymentStatus" AS TEXT),
-                CAST("PaymentDate" AS TEXT), CAST("NIN" AS TEXT),
-                CAST("NINBVN" AS TEXT), CAST("IDType" AS TEXT),
-                CAST("TrancheStatus" AS TEXT), CAST("TotalAmount" AS TEXT),
-                CAST("AccountUsed" AS TEXT), CAST("Zone" AS TEXT),
+                CAST("State" AS TEXT), 
+                CAST("LGA" AS TEXT), 
+                CAST("Ward" AS TEXT),
+                CAST("Community" AS TEXT), 
+                CAST("HouseholdID" AS TEXT),
+                CAST(nidhh AS TEXT), 
+                CAST(nid AS TEXT), CAST("Name" AS TEXT),
+                CAST("TelephoneNo" AS TEXT), 
+                CAST("Gender" AS TEXT),
+                CAST("Age" AS TEXT), 
+                CAST("HAddress" AS TEXT) AS "HAddress",
+                CAST("AccountName" AS TEXT),
+                CAST("AccountNumber" AS TEXT), 
+                CAST("BankName" AS TEXT),
+                CAST("AmountPaid" AS TEXT), 
+                CAST("PaymentStatus" AS TEXT),
+                CAST("PaymentDate" AS TEXT), 
+                CAST("TrancheStatus" AS TEXT), 
+                CAST("TotalAmount" AS TEXT),
+                CAST("Zone" AS TEXT),
                 CAST("ward_class" AS TEXT)
             FROM ben."itblDistinctThirdTranche"
         )
@@ -560,10 +492,10 @@ def export_state_beneficiaries_csv(state_name, chunk_size=100000):
 
     with engine.connect().execution_options(stream_results=True) as conn:
         for chunk in pd.read_sql(
-            query,
-            conn,
-            params={"state_name": state_name},
-            chunksize=chunk_size
+                query,
+                conn,
+                params={"state_name": state_name},
+                chunksize=chunk_size
         ):
             chunk.to_csv(
                 csv_buffer,
@@ -575,31 +507,44 @@ def export_state_beneficiaries_csv(state_name, chunk_size=100000):
             first_chunk = False
 
     return csv_buffer.getvalue(), total_rows
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_state_unique_total(state_name):
+    query = text("""
+        SELECT COUNT(DISTINCT nidhh) AS total_unique_beneficiaries
+        FROM
+        (
+            SELECT CAST(nidhh AS TEXT) AS nidhh, "State" AS state
+            FROM ben."itblDistinctPaidBeneficiaries"
+
+            UNION ALL
+
+            SELECT CAST(nidhh AS TEXT) AS nidhh, "State" AS state
+            FROM ben."itblDistinctSecondTranche"
+
+            UNION ALL
+
+            SELECT CAST(nidhh AS TEXT) AS nidhh, "State" AS state
+            FROM ben."itblDistinctThirdTranche"
+        ) unified
+        WHERE lower(state) = lower(:state_name);
+    """)
+
+    with engine.connect() as conn:
+        result = conn.execute(
+            query,
+            {"state_name": state_name}
+        ).scalar()
+
+    return int(result or 0)
+
+
 # ============================================================
 # LOGIN PAGE
 # ============================================================
 
-# if "logged_in" not in st.session_state:
-#     st.session_state.logged_in = False
-#
-# if not st.session_state.logged_in:
-#     st.title("🔐 NCTO State MIS Login")
-#
-#     username = st.text_input("Username")
-#     password = st.text_input("Password", type="password")
-#
-#     if st.button("Login"):
-#         user = authenticate_user(username.strip(), password)
-#
-#         if user:
-#             st.session_state.logged_in = True
-#             st.session_state.username = user["username"]
-#             st.session_state.state = user["state"]
-#             st.rerun()
-#         else:
-#             st.error("Invalid username or password.")
-#
-#     st.stop()
+
 
 # 1. Initialize permanent profile keys at the top
 if "logged_in" not in st.session_state:
@@ -634,18 +579,7 @@ if not st.session_state.logged_in:
 # MAIN APP
 # ============================================================
 
-#st.title("NCTO State Officer Payment Data Portal")
 
-# assigned_state = st.session_state.state
-# Returns None instead of throwing a KeyError if the state isn't found yet
-# assigned_state = st.session_state.get("state", "No State Assigned")
-#
-#
-#
-# st.sidebar.success(f"Logged in as: {st.session_state.username}")
-
-# This line 613 will now work perfectly after rerun!
-# 4. Use the safe, non-widget keys down here in your main app
 st.sidebar.success(f"Logged in as: {st.session_state.logged_in_user}")
 assigned_state = st.session_state.assigned_state
 
@@ -662,12 +596,15 @@ st.subheader(f"Payment Data for {assigned_state}")
 # ============================================================
 
 summary_df = load_state_summary(assigned_state)
-
+unique_total = load_state_unique_total(assigned_state)
 if not summary_df.empty:
     c1, c2, c3 = st.columns(3)
 
-    c1.metric("Total Beneficiaries", f"{summary_df['total_beneficiaries'].sum():,}")
-    c2.metric("Total Households", f"{summary_df['total_households'].sum():,}")
+    # c1.metric("Total Beneficiaries", f"{summary_df['total_beneficiaries'].sum():,}")
+    # c2.metric("Total Households", f"{summary_df['total_households'].sum():,}")
+
+    c1.metric("Total Beneficiaries", f"{unique_total:,}")
+    c2.metric("Total Households", f"{unique_total:,}")
     c3.metric("Tranches Available", f"{summary_df['tranche'].nunique():,}")
 
 st.markdown("### State Summary")
@@ -721,11 +658,10 @@ else:
 st.markdown("### Export Full Beneficiaries Details")
 
 if st.button(
-    "Prepare Full Beneficiaries Export",
-    key="prepare_csv_export"
+        "Prepare Full Beneficiaries Export",
+        key="prepare_csv_export"
 ):
     with st.spinner("Preparing export..."):
-
         csv_data, total_rows = export_state_beneficiaries_csv(
             assigned_state
         )
@@ -742,31 +678,7 @@ if st.button(
         key="download_full_csv"
     )
 
-# st.markdown("### Export Full Beneficiaries Details")
-#
-# st.info(
-#     "Use this option for large state exports. It writes the CSV in chunks, "
-#     "so it can handle large beneficiary records better than Excel."
-# )
-#
-# if st.button("Generate Full State Beneficiaries CSV", key="generate_full_csv"):
-#     with st.spinner("Generating CSV export..."):
-#         csv_file, total_rows = export_state_beneficiaries_csv(
-#             assigned_state,
-#             output_folder="EXPORT_FOLDER",
-#             chunk_size=100000
-#         )
-#
-#     st.success(f"CSV generated successfully. Total rows exported: {total_rows:,}")
-#
-#     with open(csv_file, "rb") as f:
-#         st.download_button(
-#             label="Download Full Beneficiaries CSV",
-#             data=f,
-#             file_name=os.path.basename(csv_file),
-#             mime="text/csv",
-#             key="download_full_beneficiaries_csv"
-#         )
+
 # ============================================================
 # DETAILED DATA FILTERS
 # ============================================================
