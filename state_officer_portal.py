@@ -607,7 +607,8 @@ if not st.session_state.logged_in:
 
 #st.title("NCTO State Officer Payment Data Portal")
 
-assigned_state = st.session_state.state
+#assigned_state = st.session_state.state
+assigned_state = st.session_state.get("state", "No State Assigned")
 
 st.sidebar.success(f"Logged in as: {st.session_state.username}")
 st.sidebar.info(f"Assigned State: {assigned_state}")
