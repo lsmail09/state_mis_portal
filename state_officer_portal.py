@@ -579,22 +579,51 @@ def export_state_beneficiaries_csv(state_name, chunk_size=100000):
 # LOGIN PAGE
 # ============================================================
 
+# if "logged_in" not in st.session_state:
+#     st.session_state.logged_in = False
+#
+# if not st.session_state.logged_in:
+#     st.title("🔐 NCTO State MIS Login")
+#
+#     username = st.text_input("Username")
+#     password = st.text_input("Password", type="password")
+#
+#     if st.button("Login"):
+#         user = authenticate_user(username.strip(), password)
+#
+#         if user:
+#             st.session_state.logged_in = True
+#             st.session_state.username = user["username"]
+#             st.session_state.state = user["state"]
+#             st.rerun()
+#         else:
+#             st.error("Invalid username or password.")
+#
+#     st.stop()
+
+# 1. Initialize permanent profile keys at the top
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
+if "logged_in_user" not in st.session_state:
+    st.session_state.logged_in_user = None
+if "assigned_state" not in st.session_state:
+    st.session_state.assigned_state = None
 
 if not st.session_state.logged_in:
     st.title("🔐 NCTO State MIS Login")
 
-    username = st.text_input("Username")
-    password = st.text_input("Password", type="password")
+    # 2. Use distinct names for your widget keys (e.g., adding '_input')
+    username_input = st.text_input("Username", key="username_widget")
+    password_input = st.text_input("Password", type="password", key="password_widget")
 
     if st.button("Login"):
-        user = authenticate_user(username.strip(), password)
+        user = authenticate_user(username_input.strip(), password_input)
 
         if user:
+            # 3. Store authentication data safely in the separate keys
             st.session_state.logged_in = True
-            st.session_state.username = user["username"]
-            st.session_state.state = user["state"]
+            st.session_state.logged_in_user = user["username"]
+            st.session_state.assigned_state = user["state"]
             st.rerun()
         else:
             st.error("Invalid username or password.")
@@ -607,10 +636,19 @@ if not st.session_state.logged_in:
 
 #st.title("NCTO State Officer Payment Data Portal")
 
-#assigned_state = st.session_state.state
-assigned_state = st.session_state.get("state", "No State Assigned")
+# assigned_state = st.session_state.state
+# Returns None instead of throwing a KeyError if the state isn't found yet
+# assigned_state = st.session_state.get("state", "No State Assigned")
+#
+#
+#
+# st.sidebar.success(f"Logged in as: {st.session_state.username}")
 
-st.sidebar.success(f"Logged in as: {st.session_state.username}")
+# This line 613 will now work perfectly after rerun!
+# 4. Use the safe, non-widget keys down here in your main app
+st.sidebar.success(f"Logged in as: {st.session_state.logged_in_user}")
+assigned_state = st.session_state.assigned_state
+
 st.sidebar.info(f"Assigned State: {assigned_state}")
 
 if st.sidebar.button("Logout"):
