@@ -1,19 +1,20 @@
 # Use the official Python image
 FROM python:3.14-slim
 
-# Install system dependencies required for pyodbc and MS SQL
+# Install system dependencies and tools needed to download keys safely
 RUN apt-get update && apt-get install -y \
     build-essential \
     unixodbc-dev \
     curl \
-    gnupg2 \
+    gnupg \
     && rm -rf /var/lib/apt/lists/*
 
-# Add Microsoft SQL Server ODBC Driver repository and install it
-RUN curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - \
-    && curl https://microsoft.com > /etc/apt/sources.list.d/mssql-release.list \
-    && apt-get update \
-    && ACCEPT_EULA=Y apt-get install -y msodbcsql18
+# Fix: Securely download the Microsoft GPG key and add the proper repository list
+RUN curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg \
+    && curl -fsSL https://packages.microsoft.com/config/debian/12/prod.list | tee /etc/apt/sources.list.d/mssql-release.list
+
+# Update package lists and install the MS SQL Server ODBC driver
+RUN apt-get update && ACCEPT_EULA=Y apt-get install -y msodbcsql18
 
 # Set up the application directory
 WORKDIR /app
