@@ -7,19 +7,36 @@ from sqlalchemy.engine import URL
 import os
 from datetime import datetime
 import io
+import extra_streamlit_components as stx
+import time
 
 # ============================================================
 # POSTGRES CONFIG
 # ============================================================
 
-
+# PG_HOST = "102.164.37.69"
+# PG_PORT = 5432
+# PG_DATABASE = "ben_db"
+# PG_USER = "ben_user"
+# PG_PASSWORD = "Olajumokepsgr@9@9"
+# PG_SCHEMA = "ben"
+#
+# engine = create_engine(
+#     f"postgresql+psycopg2://{PG_USER}:{PG_PASSWORD}@{PG_HOST}:{PG_PORT}/{PG_DATABASE}",
+#     pool_pre_ping=True
+# )
+#
 st.set_page_config(
     page_title="NCTO State Officer Portal",
     page_icon="🔐",
     layout="wide"
 )
 
-
+# PG_HOST = "102.164.37.69"
+# PG_PORT = 5432
+# PG_DATABASE = "your_database"
+# PG_USER = "your_username"
+# PG_PASSWORD = "9@9"   # example, keep your real password here
 
 PG_HOST = "102.164.37.69"
 PG_PORT = 5432
@@ -53,6 +70,11 @@ EXPORT_FOLDER = os.path.join(
 # AUTHENTICATION
 # ============================================================
 
+
+
+# ============================================================
+# 1. DATABASE & AUTHENTICATION FUNCTIONS (Your Existing Code)
+# ============================================================
 def verify_password(plain_password, password_hash):
     return bcrypt.checkpw(
         plain_password.encode("utf-8"),
@@ -67,7 +89,6 @@ def authenticate_user(username, password):
         WHERE lower(username) = lower(:username)
           AND is_active = true;
     """)
-
     with engine.connect() as conn:
         user = conn.execute(query, {"username": username}).mappings().first()
 
@@ -79,15 +100,97 @@ def authenticate_user(username, password):
             "username": user["username"],
             "state": user["assigned_state"]
         }
-
     return None
+
+
+# ============================================================
+# 2. COOKIE MANIPULATION AND APP INITIALIZATION
+# ============================================================
+# FIX: Instantiating class safely using Streamlit's architecture pattern
+if "cookie_manager" not in st.session_state:
+    st.session_state.cookie_manager = stx.CookieManager()
+
+cookie_manager = st.session_state.cookie_manager
+
+# Fallback session state initialization
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+
+# Read persistent keys directly from browser if they exist
+saved_username = cookie_manager.get(cookie="ncto_logged_in_user")
+saved_state = cookie_manager.get(cookie="ncto_user_state")
+
+# Automatically switch to logged-in mode if cookies are found
+if saved_username and saved_state:
+    st.session_state.logged_in = True
+    st.session_state.logged_in_user = saved_username
+    st.session_state.assigned_state = saved_state
+
+# ============================================================
+# 3. INTERACTIVE LOGIN ROUTINE
+# ============================================================
+if not st.session_state.logged_in:
+    st.title("🔐 NCTO State MIS Login")
+
+    username_input = st.text_input("Username", key="username_widget")
+    password_input = st.text_input("Password", type="password", key="password_widget")
+
+    if st.button("Login"):
+        user = authenticate_user(username_input.strip(), password_input)
+
+        if user:
+            # Set runtime state
+            st.session_state.logged_in = True
+            st.session_state.logged_in_user = user["username"]
+            st.session_state.assigned_state = user["state"]
+
+            # FIX: Explicitly pass unique key strings to avoid the internal 'set' conflict
+            cookie_manager.set("ncto_logged_in_user", user["username"], max_age=604800, key="set_cookie_username")
+            cookie_manager.set("ncto_user_state", user["state"], max_age=604800, key="set_cookie_state")
+
+            time.sleep(0.2)
+            st.rerun()
+        else:
+            st.error("Invalid username or password.")
+
+    st.stop()
+
+
+
+
+# def verify_password(plain_password, password_hash):
+#     return bcrypt.checkpw(
+#         plain_password.encode("utf-8"),
+#         password_hash.encode("utf-8")
+#     )
+#
+#
+# def authenticate_user(username, password):
+#     query = text("""
+#         SELECT username, password_hash, assigned_state
+#         FROM ben.state_officer_users
+#         WHERE lower(username) = lower(:username)
+#           AND is_active = true;
+#     """)
+#
+#     with engine.connect() as conn:
+#         user = conn.execute(query, {"username": username}).mappings().first()
+#
+#     if user and bcrypt.checkpw(
+#             password.encode("utf-8"),
+#             user["password_hash"].encode("utf-8")
+#     ):
+#         return {
+#             "username": user["username"],
+#             "state": user["assigned_state"]
+#         }
+#
+#     return None
 
 
 # ============================================================
 # DATA QUERY
 # ============================================================
-
-
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_state_summary(state_name):
@@ -296,18 +399,16 @@ def load_state_data(state_name, tranche_filter, search_value, limit_rows):
         )
         SELECT *
         FROM unified_payments
-        WHERE "State" = ben.normalize_location_name(:state_name)
+        WHERE "CleanedState" = ben.normalize_location_name(:state_name)
         
         {tranche_condition}
         {search_condition}
-        ORDER BY tranche, "LGA", "Ward", "Community"
+        ORDER BY tranche,"OriginalLGA", "OriginalWard", "OriginalCommunity"  
         LIMIT :limit_rows;
     """)
 
     with engine.connect() as conn:
         return pd.read_sql(query, conn, params=params)
-
-
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -387,9 +488,6 @@ def load_lga_summary(state_name):
             conn,
             params={"state_name": state_name}
         )
-
-
-
 
 
 
@@ -544,50 +642,61 @@ def load_state_unique_total(state_name):
 # LOGIN PAGE
 # ============================================================
 
-
-
-# 1. Initialize permanent profile keys at the top
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-if "logged_in_user" not in st.session_state:
-    st.session_state.logged_in_user = None
-if "assigned_state" not in st.session_state:
-    st.session_state.assigned_state = None
-
-if not st.session_state.logged_in:
-    st.title("🔐 NCTO State MIS Login")
-
-    # 2. Use distinct names for your widget keys (e.g., adding '_input')
-    username_input = st.text_input("Username", key="username_widget")
-    password_input = st.text_input("Password", type="password", key="password_widget")
-
-    if st.button("Login"):
-        user = authenticate_user(username_input.strip(), password_input)
-
-        if user:
-            # 3. Store authentication data safely in the separate keys
-            st.session_state.logged_in = True
-            st.session_state.logged_in_user = user["username"]
-            st.session_state.assigned_state = user["state"]
-            st.rerun()
-        else:
-            st.error("Invalid username or password.")
-
-    st.stop()
+# # 1. Initialize permanent profile keys at the top
+# if "logged_in" not in st.session_state:
+#     st.session_state.logged_in = False
+# if "logged_in_user" not in st.session_state:
+#     st.session_state.logged_in_user = None
+# if "assigned_state" not in st.session_state:
+#     st.session_state.assigned_state = None
+#
+# if not st.session_state.logged_in:
+#     st.title("🔐 NCTO State MIS Login")
+#
+#     # 2. Use distinct names for your widget keys (e.g., adding '_input')
+#     username_input = st.text_input("Username", key="username_widget")
+#     password_input = st.text_input("Password", type="password", key="password_widget")
+#
+#     if st.button("Login"):
+#         user = authenticate_user(username_input.strip(), password_input)
+#
+#         if user:
+#             # 3. Store authentication data safely in the separate keys
+#             st.session_state.logged_in = True
+#             st.session_state.logged_in_user = user["username"]
+#             st.session_state.assigned_state = user["state"]
+#             st.rerun()
+#         else:
+#             st.error("Invalid username or password.")
+#
+#     st.stop()
 
 # ============================================================
 # MAIN APP
 # ============================================================
 
-
 st.sidebar.success(f"Logged in as: {st.session_state.logged_in_user}")
 assigned_state = st.session_state.assigned_state
 
-st.sidebar.info(f"Assigned State: {assigned_state}")
-
+# Clear state entirely on structural user logout
 if st.sidebar.button("Logout"):
-    st.session_state.clear()
+    # FIX: Explicitly pass unique key strings to avoid internal 'delete' conflicts too
+    cookie_manager.delete("ncto_logged_in_user", key="delete_cookie_username")
+    cookie_manager.delete("ncto_user_state", key="delete_cookie_state")
+    st.session_state.logged_in = False
+    time.sleep(0.2)
     st.rerun()
+
+
+
+# st.sidebar.success(f"Logged in as: {st.session_state.logged_in_user}")
+# assigned_state = st.session_state.assigned_state
+#
+# st.sidebar.info(f"Assigned State: {assigned_state}")
+#
+# if st.sidebar.button("Logout"):
+#     st.session_state.clear()
+#     st.rerun()
 
 st.subheader(f"Payment Data for {assigned_state}")
 
@@ -678,7 +787,31 @@ if st.button(
         key="download_full_csv"
     )
 
-
+# st.markdown("### Export Full Beneficiaries Details")
+#
+# st.info(
+#     "Use this option for large state exports. It writes the CSV in chunks, "
+#     "so it can handle large beneficiary records better than Excel."
+# )
+#
+# if st.button("Generate Full State Beneficiaries CSV", key="generate_full_csv"):
+#     with st.spinner("Generating CSV export..."):
+#         csv_file, total_rows = export_state_beneficiaries_csv(
+#             assigned_state,
+#             output_folder="EXPORT_FOLDER",
+#             chunk_size=100000
+#         )
+#
+#     st.success(f"CSV generated successfully. Total rows exported: {total_rows:,}")
+#
+#     with open(csv_file, "rb") as f:
+#         st.download_button(
+#             label="Download Full Beneficiaries CSV",
+#             data=f,
+#             file_name=os.path.basename(csv_file),
+#             mime="text/csv",
+#             key="download_full_beneficiaries_csv"
+#         )
 # ============================================================
 # DETAILED DATA FILTERS
 # ============================================================
