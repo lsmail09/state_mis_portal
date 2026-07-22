@@ -12,8 +12,10 @@ import bcrypt
 import extra_streamlit_components as stx
 import pandas as pd
 import streamlit as st
-from sqlalchemy import URL, create_engine, text
+from sqlalchemy import URL, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.engine import URL
+from sqlalchemy import create_engine
 
 
 # ============================================================
@@ -75,39 +77,11 @@ DETAIL_COLUMNS = [
 # 3. DATABASE CONFIGURATION
 # ============================================================
 
-def get_setting(name: str, default: Optional[str] = None) -> Optional[str]:
-    """
-    Read a setting from Streamlit secrets first and then environment variables.
-
-    Example .streamlit/secrets.toml:
-
-        PG_HOST = "102.164.37.69"
-        PG_PORT = "5432"
-        PG_DATABASE = "ben_db"
-        PG_USER = "ben_user"
-        PG_PASSWORD = "your-password"
-    """
-    try:
-        if name in st.secrets:
-            return str(st.secrets[name])
-    except Exception:
-        pass
-
-    return os.getenv(name, default)
-
-
-PG_HOST = st.secrets["PG_HOST"]
-PG_PORT = int(st.secrets["PG_PORT"])
-PG_DATABASE = st.secrets["PG_DATABASE"]
-PG_USER = st.secrets["PG_USER"]
-PG_PASSWORD = st.secrets["PG_PASSWORD"]
-
-if not PG_PASSWORD:
-    st.error(
-        "Database password is not configured. Add PG_PASSWORD to "
-        ".streamlit/secrets.toml or to the server environment."
-    )
-    st.stop()
+PG_HOST = "102.164.37.69"
+PG_PORT = 5432
+PG_DATABASE = "ben_db"
+PG_USER = "ben_user"
+PG_PASSWORD = "Olajumokepsgr#9#9"
 
 DATABASE_URL = URL.create(
     drivername="postgresql+psycopg2",
@@ -116,6 +90,14 @@ DATABASE_URL = URL.create(
     host=PG_HOST,
     port=PG_PORT,
     database=PG_DATABASE,
+)
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_recycle=1800,
+    pool_size=5,
+    max_overflow=5,
 )
 
 
