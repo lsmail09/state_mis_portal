@@ -96,11 +96,11 @@ def get_setting(name: str, default: Optional[str] = None) -> Optional[str]:
     return os.getenv(name, default)
 
 
-PG_HOST = get_setting("PG_HOST", "102.164.37.69")
-PG_PORT = int(get_setting("PG_PORT", "5432") or 5432)
-PG_DATABASE = get_setting("PG_DATABASE", "ben_db")
-PG_USER = get_setting("PG_USER", "ben_user")
-PG_PASSWORD = get_setting("PG_PASSWORD")
+PG_HOST = st.secrets["PG_HOST"]
+PG_PORT = int(st.secrets["PG_PORT"])
+PG_DATABASE = st.secrets["PG_DATABASE"]
+PG_USER = st.secrets["PG_USER"]
+PG_PASSWORD = st.secrets["PG_PASSWORD"]
 
 if not PG_PASSWORD:
     st.error(
