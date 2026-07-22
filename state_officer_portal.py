@@ -905,7 +905,7 @@ def render_sidebar(
             "Portal overview",
             "State and tranche metrics",
             "LGA-level distribution",
-            "Search without reloading summaries",
+            "Search Beneficiaries Details",
             "Prepare the complete CSV file",
         ],
     )
@@ -930,9 +930,7 @@ def render_home_page(assigned_state: str) -> None:
     st.subheader(f"{assigned_state} State")
 
     st.info(
-        "Select a function from the sidebar. Each section now loads separately, "
-        "so opening the portal does not automatically run all summary, search, "
-        "and export queries."
+        "Select a function from the sidebar."
     )
 
     col1, col2, col3 = st.columns(3)
@@ -943,11 +941,11 @@ def render_home_page(assigned_state: str) -> None:
 
     with col2:
         st.markdown("#### Beneficiary Search")
-        st.write("Search a separate result table without recalculating summaries.")
+        st.write("Search a Beneficiaries Details.")
 
     with col3:
         st.markdown("#### Full Export")
-        st.write("Prepare a compressed CSV directly from PostgreSQL.")
+        st.write("Prepare a compressed CSV directly Database.")
 
 
 def render_state_summary_page(assigned_state: str) -> None:
@@ -1113,8 +1111,7 @@ def render_search_page(assigned_state: str) -> None:
     """
     st.title("Beneficiary Search")
     st.caption(
-        "Search results are displayed in a separate table and do not "
-        "recalculate the summary pages."
+        "Search results are displayed Here."
     )
 
     with st.form("beneficiary_search_form"):
@@ -1156,8 +1153,7 @@ def render_search_page(assigned_state: str) -> None:
     if search_submitted:
         if not search_value.strip():
             st.warning(
-                "Enter a search value. Loading an unfiltered detail table "
-                "is disabled on the search page to protect performance."
+                "Enter a search value."
             )
         else:
             try:
@@ -1225,9 +1221,7 @@ def render_full_export_page(assigned_state: str) -> None:
     )
 
     st.info(
-        "For large states, use compressed CSV. PostgreSQL COPY streams records "
-        "directly to the file, and the export is not sorted because sorting "
-        "millions of rows causes unnecessary delay."
+        "For large states, use compressed CSV."
     )
 
     compress_file = st.checkbox(
@@ -1264,7 +1258,7 @@ def render_full_export_page(assigned_state: str) -> None:
 
         try:
             with st.spinner(
-                "Streaming state records from PostgreSQL into the export file..."
+                "Streaming state records from Database into the export file..."
             ):
                 export_path, estimated_rows = prepare_full_state_export(
                     state_name=assigned_state,
