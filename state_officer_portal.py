@@ -12,10 +12,8 @@ import bcrypt
 import extra_streamlit_components as stx
 import pandas as pd
 import streamlit as st
-from sqlalchemy import URL, text
+from sqlalchemy import URL, create_engine, text
 from sqlalchemy.engine import Engine
-from sqlalchemy.engine import URL
-from sqlalchemy import create_engine
 
 
 # ============================================================
@@ -39,6 +37,7 @@ CACHE_TTL_SECONDS = 900
 SEARCH_DEFAULT_LIMIT = 1_000
 SEARCH_MAX_LIMIT = 10_000
 EXPORT_RETENTION_HOURS = 12
+EXPORT_REUSE_HOURS = 6
 
 PAYMENT_TABLES = (
     ("First Tranche", 'ben."itblDistinctPaidBeneficiaries"'),
@@ -860,6 +859,55 @@ def open_export_file(file_path: str) -> BinaryIO:
     return open(file_path, "rb")
 
 
+def find_reusable_state_export(
+    state_name: str,
+    prefer_compressed: bool = True,
+) -> Optional[str]:
+    """
+    Return the newest valid export already prepared for this state.
+
+    A prepared file is shared across officer sessions on the same Render
+    instance. This prevents every officer from launching the same expensive
+    database export independently.
+    """
+    safe_state = normalize_filename(state_name).lower()
+    expected_suffix = ".csv.gz" if prefer_compressed else ".csv"
+    cutoff = datetime.now() - timedelta(hours=EXPORT_REUSE_HOURS)
+
+    candidates = sorted(
+        get_export_directory().glob(
+            f"ncto_export_{safe_state}_*{expected_suffix}"
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+    for candidate in candidates:
+        try:
+            modified_at = datetime.fromtimestamp(candidate.stat().st_mtime)
+
+            if modified_at >= cutoff and candidate.stat().st_size > 0:
+                return str(candidate)
+        except OSError:
+            continue
+
+    return None
+
+
+def deferred_export_reader(file_path: str):
+    """
+    Return a zero-argument callable for st.download_button.
+
+    Streamlit executes the callable only when the officer clicks Download.
+    Returning a buffered file object avoids loading the full export during
+    every page rerun.
+    """
+    def _reader():
+        return open(file_path, "rb")
+
+    return _reader
+
+
 def clear_current_export() -> None:
     """Delete the current session's generated export."""
     export_path = st.session_state.get("full_export_path")
@@ -905,7 +953,7 @@ def render_sidebar(
             "Portal overview",
             "State and tranche metrics",
             "LGA-level distribution",
-            "Search Beneficiaries Details",
+            "Search without reloading summaries",
             "Prepare the complete CSV file",
         ],
     )
@@ -930,7 +978,9 @@ def render_home_page(assigned_state: str) -> None:
     st.subheader(f"{assigned_state} State")
 
     st.info(
-        "Select a function from the sidebar."
+        "Select a function from the sidebar. Each section now loads separately, "
+        "so opening the portal does not automatically run all summary, search, "
+        "and export queries."
     )
 
     col1, col2, col3 = st.columns(3)
@@ -941,11 +991,11 @@ def render_home_page(assigned_state: str) -> None:
 
     with col2:
         st.markdown("#### Beneficiary Search")
-        st.write("Search a Beneficiaries Details.")
+        st.write("Search a separate result table without recalculating summaries.")
 
     with col3:
         st.markdown("#### Full Export")
-        st.write("Prepare a compressed CSV directly Database.")
+        st.write("Prepare a compressed CSV directly from PostgreSQL.")
 
 
 def render_state_summary_page(assigned_state: str) -> None:
@@ -1111,7 +1161,8 @@ def render_search_page(assigned_state: str) -> None:
     """
     st.title("Beneficiary Search")
     st.caption(
-        "Search results are displayed Here."
+        "Search results are displayed in a separate table and do not "
+        "recalculate the summary pages."
     )
 
     with st.form("beneficiary_search_form"):
@@ -1153,7 +1204,8 @@ def render_search_page(assigned_state: str) -> None:
     if search_submitted:
         if not search_value.strip():
             st.warning(
-                "Enter a search value."
+                "Enter a search value. Loading an unfiltered detail table "
+                "is disabled on the search page to protect performance."
             )
         else:
             try:
@@ -1213,61 +1265,125 @@ def render_search_page(assigned_state: str) -> None:
 
 
 def render_full_export_page(assigned_state: str) -> None:
-    """Render the dedicated file-based full export page."""
+    """
+    Render the remote-user-safe full export page.
+
+    A recent export is reused across sessions, and the download file is opened
+    only after the officer clicks the final download button.
+    """
     st.title("Full Beneficiary Details Export")
     st.caption(
-        "The export is generated on the server and becomes downloadable "
-        "after preparation finishes."
+        "Prepare once and download. A recent state export can be reused by "
+        "other authorized officers instead of querying the database again."
     )
 
     st.info(
-        "For large states, use compressed CSV."
+        "Compressed CSV.GZ is strongly recommended for remote users. It is "
+        "smaller, transfers faster, and uses less Render memory."
     )
 
     compress_file = st.checkbox(
         "Compress as CSV.GZ",
         value=True,
-        help=(
-            "Recommended. The compressed file is usually much smaller and "
-            "downloads faster. It can be opened with 7-Zip, WinRAR, or Python."
-        ),
+        help="Recommended for large state files and remote downloads.",
     )
 
-    generate_col, clear_col = st.columns([2, 1])
+    current_path = st.session_state.get("full_export_path")
+    current_state = st.session_state.get("full_export_state")
+
+    if (
+        not current_path
+        or current_state != assigned_state
+        or not Path(current_path).exists()
+    ):
+        reusable_path = find_reusable_state_export(
+            assigned_state,
+            prefer_compressed=compress_file,
+        )
+
+        if reusable_path:
+            st.session_state.full_export_path = reusable_path
+            st.session_state.full_export_state = assigned_state
+            st.session_state.full_export_rows = load_state_unique_total(
+                assigned_state
+            )
+
+    generate_col, refresh_col, clear_col = st.columns([2, 1, 1])
 
     with generate_col:
         generate_clicked = st.button(
-            "Prepare Full State Export",
+            "Prepare or Reuse Full State Export",
             type="primary",
-            use_container_width=True,
+            width="stretch",
+        )
+
+    with refresh_col:
+        force_refresh_clicked = st.button(
+            "Force New Export",
+            width="stretch",
+            help="Use only when the existing export is outdated.",
         )
 
     with clear_col:
         clear_clicked = st.button(
-            "Clear Prepared Export",
-            use_container_width=True,
+            "Clear My Selection",
+            width="stretch",
         )
 
     if clear_clicked:
-        clear_current_export()
-        st.success("Prepared export cleared.")
+        st.session_state.full_export_path = None
+        st.session_state.full_export_rows = None
+        st.session_state.full_export_state = None
+        st.success("Your prepared export selection was cleared.")
         st.rerun()
 
-    if generate_clicked:
-        clear_current_export()
+    prepare_new_export = force_refresh_clicked
 
+    if generate_clicked:
+        reusable_path = find_reusable_state_export(
+            assigned_state,
+            prefer_compressed=compress_file,
+        )
+
+        if reusable_path:
+            st.session_state.full_export_path = reusable_path
+            st.session_state.full_export_state = assigned_state
+            st.session_state.full_export_rows = load_state_unique_total(
+                assigned_state
+            )
+            st.success(
+                "A recent export for this state was found and reused. "
+                "No new database export was required."
+            )
+        else:
+            prepare_new_export = True
+
+    if prepare_new_export:
         try:
-            with st.spinner(
-                "Streaming state records from Database into the export file..."
-            ):
+            with st.status(
+                "Preparing the state export...",
+                expanded=True,
+            ) as status:
+                st.write("Reading state records directly from PostgreSQL.")
+                st.write(
+                    "The export is not sorted, which avoids a costly "
+                    "multi-million-row database sort."
+                )
+
                 export_path, estimated_rows = prepare_full_state_export(
                     state_name=assigned_state,
                     compress_file=compress_file,
                 )
 
-            st.session_state.full_export_path = export_path
-            st.session_state.full_export_rows = estimated_rows
-            st.session_state.full_export_state = assigned_state
+                st.session_state.full_export_path = export_path
+                st.session_state.full_export_rows = estimated_rows
+                st.session_state.full_export_state = assigned_state
+
+                status.update(
+                    label="Export prepared successfully.",
+                    state="complete",
+                    expanded=False,
+                )
 
         except Exception as exc:
             st.error(f"Unable to prepare the full export: {exc}")
@@ -1286,30 +1402,46 @@ def render_full_export_page(assigned_state: str) -> None:
             st.session_state.get("full_export_rows") or 0
         )
 
-        st.success("The export file is ready.")
-        info1, info2 = st.columns(2)
+        st.success("The export is ready for download.")
+
+        info1, info2, info3 = st.columns(3)
         info1.metric(
             "Estimated Unique Beneficiaries",
             f"{estimated_rows:,}",
         )
-        info2.metric("Prepared File Size", format_file_size(file_size))
+        info2.metric(
+            "Prepared File Size",
+            format_file_size(file_size),
+        )
+        info3.metric(
+            "File Type",
+            "CSV.GZ" if file_path.suffix == ".gz" else "CSV",
+        )
 
-        download_file = open_export_file(str(file_path))
+        st.warning(
+            "Keep this page open until the browser confirms that the "
+            "download has started. Do not click the download button repeatedly."
+        )
 
-        try:
-            st.download_button(
-                label=f"Download {file_path.name}",
-                data=download_file,
-                file_name=file_path.name,
-                mime=(
-                    "application/gzip"
-                    if file_path.suffix == ".gz"
-                    else "text/csv"
-                ),
-                use_container_width=True,
-            )
-        finally:
-            download_file.close()
+        st.download_button(
+            label=f"Download {file_path.name}",
+            data=deferred_export_reader(str(file_path)),
+            file_name=file_path.name,
+            mime=(
+                "application/gzip"
+                if file_path.suffix == ".gz"
+                else "text/csv"
+            ),
+            on_click="ignore",
+            type="primary",
+            width="stretch",
+            key=f"remote_download_{file_path.name}",
+        )
+
+        st.caption(
+            "Prepared exports are temporary and may disappear when the "
+            "Render service restarts or redeploys."
+        )
 
 
 # ============================================================
