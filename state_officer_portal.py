@@ -68,7 +68,8 @@ DETAIL_COLUMNS = [
     "TrancheStatus",
     "TotalAmount",
     "Zone",
-    "ward_class",
+    "Ward_CLass",
+   # "ward_class",
 ]
 
 
@@ -653,7 +654,8 @@ def build_search_union_sql(
                 CAST("TrancheStatus" AS TEXT) AS "TrancheStatus",
                 CAST("TotalAmount" AS TEXT) AS "TotalAmount",
                 CAST("Zone" AS TEXT) AS "Zone",
-                CAST("ward_class" AS TEXT) AS "ward_class"
+                CAST("Ward_Class" AS TEXT) AS "Ward_Class"
+               
             FROM {table_name}
             WHERE ben.normalize_location_name("State")
                   = ben.normalize_location_name(:state_name)
@@ -763,7 +765,8 @@ def build_full_export_select_sql() -> str:
                 CAST("TrancheStatus" AS TEXT) AS "TrancheStatus",
                 CAST("TotalAmount" AS TEXT) AS "TotalAmount",
                 CAST("Zone" AS TEXT) AS "Zone",
-                CAST("ward_class" AS TEXT) AS "ward_class"
+                CAST("Ward_Class" AS TEXT) AS "Ward_Class"
+                
             FROM {table_name}
             WHERE ben.normalize_location_name("State")
                   = ben.normalize_location_name(%s)
