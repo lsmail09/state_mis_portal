@@ -1,466 +1,387 @@
-import gzip
-import io
-import os
-import re
-import tempfile
-import time
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Any, BinaryIO, Optional
+# ============================================================
+# NCTO STATE OFFICER PORTAL
+# ============================================================
 
+import os
+import io
+import re
+import json
+import gzip
+import hmac
+import time
+import base64
+import hashlib
 import bcrypt
-import extra_streamlit_components as stx
+import tempfile
+import threading
+
+from pathlib import Path
+from datetime import datetime
+from urllib.parse import urlparse, parse_qs, quote
+from concurrent.futures import ThreadPoolExecutor
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
 import pandas as pd
 import streamlit as st
-from sqlalchemy import URL, create_engine, text
-from sqlalchemy.engine import Engine
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import URL
 
 
 # ============================================================
-# 1. STREAMLIT PAGE CONFIGURATION
+# STREAMLIT CONFIG
 # ============================================================
 
 st.set_page_config(
     page_title="NCTO State Officer Portal",
     page_icon="🔐",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="expanded"
 )
 
 
 # ============================================================
-# 2. APPLICATION CONSTANTS
-# ============================================================
-
-APP_TITLE = "NCTO State Officer Portal"
-CACHE_TTL_SECONDS = 900
-SEARCH_DEFAULT_LIMIT = 1_000
-SEARCH_MAX_LIMIT = 10_000
-EXPORT_RETENTION_HOURS = 12
-EXPORT_REUSE_HOURS = 6
-
-PAYMENT_TABLES = (
-    ("First Tranche", 'ben."itblDistinctPaidBeneficiaries"'),
-    ("Second Tranche", 'ben."itblDistinctSecondTranche"'),
-    ("Third Tranche", 'ben."itblDistinctThirdTranche"'),
-)
-
-DETAIL_COLUMNS = [
-    "tranche",
-    "State",
-    "LGA",
-    "Ward",
-    "Community",
-    "HouseholdID",
-    "nidhh",
-    "nid",
-    "Name",
-    "TelephoneNo",
-    "Gender",
-    "Age",
-    "HAddress",
-    "AccountName",
-    "AccountNumber",
-    "BankName",
-    "AmountPaid",
-    "PaymentStatus",
-    "PaymentDate",
-    "TrancheStatus",
-    "TotalAmount",
-    "Zone",
-    "Ward_CLass",
-   # "ward_class",
-]
-
-
-# ============================================================
-# 3. DATABASE CONFIGURATION
+# POSTGRESQL CONFIG
 # ============================================================
 
 PG_HOST = "102.164.37.69"
 PG_PORT = 5432
+
 PG_DATABASE = "ben_db"
 PG_USER = "ben_user"
 PG_PASSWORD = "Olajumokepsgr#9#9"
 
-DATABASE_URL = URL.create(
-    drivername="postgresql+psycopg2",
-    username=PG_USER,
-    password=PG_PASSWORD,
-    host=PG_HOST,
-    port=PG_PORT,
-    database=PG_DATABASE,
+
+# ============================================================
+# DIRECT DOWNLOAD SERVER CONFIG
+#
+# IMPORTANT:
+# Change PUBLIC_DOWNLOAD_BASE_URL to the IP/domain of the
+# machine where this Streamlit application is running.
+#
+# Example:
+# PUBLIC_DOWNLOAD_BASE_URL = "http://102.164.37.69:8765"
+# ============================================================
+
+DOWNLOAD_HOST = "0.0.0.0"
+DOWNLOAD_PORT = 8765
+
+# PUBLIC_DOWNLOAD_BASE_URL = "http://YOUR_SERVER_IP:8765"
+PUBLIC_DOWNLOAD_BASE_URL = "http://102.164.37.69:8765"
+DOWNLOAD_SECRET = (
+    "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET_KEY_FOR_NCTO"
 )
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    pool_recycle=1800,
-    pool_size=5,
-    max_overflow=5,
+# Link valid for 8 hours
+DOWNLOAD_TOKEN_LIFETIME = 8 * 60 * 60
+
+
+# ============================================================
+# EXPORT CONFIG
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+EXPORT_DIR = BASE_DIR / "exports"
+
+EXPORT_DIR.mkdir(
+    parents=True,
+    exist_ok=True
 )
+
+# Limit simultaneous large exports
+EXPORT_WORKERS = 2
+
+
+# ============================================================
+# PAYMENT TABLES
+# ============================================================
+
+PAYMENT_TABLES = [
+    (
+        "First Tranche",
+        'ben."itblDistinctPaidBeneficiaries"'
+    ),
+    (
+        "Second Tranche",
+        'ben."itblDistinctSecondTranche"'
+    ),
+    (
+        "Third Tranche",
+        'ben."itblDistinctThirdTranche"'
+    ),
+]
+
+
+# ============================================================
+# DATABASE ENGINE
+# ============================================================
+
+@st.cache_resource
+def get_engine():
+
+    database_url = URL.create(
+        drivername="postgresql+psycopg2",
+        username=PG_USER,
+        password=PG_PASSWORD,
+        host=PG_HOST,
+        port=PG_PORT,
+        database=PG_DATABASE,
+    )
+
+    return create_engine(
+        database_url,
+        pool_pre_ping=True,
+        pool_recycle=1800,
+        pool_size=5,
+        max_overflow=10,
+    )
+
+
+engine = get_engine()
+
+
+# ============================================================
+# EXPORT THREAD RESOURCES
+# ============================================================
+
+@st.cache_resource
+def get_export_executor():
+
+    return ThreadPoolExecutor(
+        max_workers=EXPORT_WORKERS,
+        thread_name_prefix="ncto_export"
+    )
 
 
 @st.cache_resource
-def get_engine() -> Engine:
-    """
-    Create one reusable SQLAlchemy connection pool.
+def get_export_jobs():
 
-    The original code created a global engine without recycling stale
-    connections. The settings below are safer for a long-running Streamlit app.
-    """
-    return create_engine(
-        DATABASE_URL,
-        pool_pre_ping=True,
-        pool_recycle=1_800,
-        pool_size=5,
-        max_overflow=5,
-        connect_args={
-            "connect_timeout": 20,
-            "application_name": "ncto_state_officer_portal",
-        },
+    return {}
+
+
+@st.cache_resource
+def get_export_lock():
+
+    return threading.Lock()
+
+
+STATUS_FILE_LOCK = threading.Lock()
+
+
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
+
+def safe_filename(value):
+
+    value = str(
+        value or ""
+    ).strip()
+
+    value = re.sub(
+        r'[\\/:*?"<>|]+',
+        "_",
+        value
+    )
+
+    value = re.sub(
+        r"\s+",
+        "_",
+        value
+    )
+
+    return value or "Export"
+
+
+def dataframe_to_excel_bytes(
+    df,
+    sheet_name="Summary"
+):
+
+    output = io.BytesIO()
+
+    with pd.ExcelWriter(
+        output,
+        engine="openpyxl"
+    ) as writer:
+
+        df.to_excel(
+            writer,
+            sheet_name=sheet_name[:31],
+            index=False
+        )
+
+    output.seek(0)
+
+    return output.getvalue()
+
+
+def dataframe_to_csv_bytes(df):
+
+    return (
+        df.to_csv(
+            index=False
+        )
+        .encode(
+            "utf-8-sig"
+        )
     )
 
 
 # ============================================================
-# 4. GENERAL HELPERS
+# AUTHENTICATION
 # ============================================================
 
-def normalize_filename(value: str) -> str:
-    """Return a safe component for generated filenames."""
-    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", str(value).strip())
-    return cleaned.strip("_") or "state"
-
-
-def dataframe_to_excel_bytes(
-    dataframe: pd.DataFrame,
-    sheet_name: str,
-) -> bytes:
-    """Create an Excel download in memory without writing into the app folder."""
-    output = io.BytesIO()
-
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        dataframe.to_excel(
-            writer,
-            index=False,
-            sheet_name=sheet_name[:31],
-        )
-
-    output.seek(0)
-    return output.getvalue()
-
-
-def dataframe_to_csv_bytes(dataframe: pd.DataFrame) -> bytes:
-    """Create an Excel-compatible UTF-8 CSV from a DataFrame."""
-    return dataframe.to_csv(
-        index=False,
-        lineterminator="\n",
-    ).encode("utf-8-sig")
-
-
-def format_file_size(size_bytes: int) -> str:
-    """Convert a byte count into a readable file size."""
-    size = float(size_bytes)
-
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if size < 1024 or unit == "TB":
-            return f"{size:,.2f} {unit}"
-        size /= 1024
-
-    return f"{size_bytes:,} B"
-
-
-def get_export_directory() -> Path:
-    """
-    Return a server-side temporary export directory.
-
-    This is intentionally not the user's local Downloads folder. A Streamlit
-    server cannot directly write into a remote user's browser Downloads folder.
-    The generated file stays on the server until the user clicks Download.
-    """
-    export_dir = Path(tempfile.gettempdir()) / "ncto_state_portal_exports"
-    export_dir.mkdir(parents=True, exist_ok=True)
-    return export_dir
-
-
-def cleanup_old_export_files() -> None:
-    """Delete abandoned export files older than the configured retention period."""
-    cutoff = datetime.now() - timedelta(hours=EXPORT_RETENTION_HOURS)
-
-    for file_path in get_export_directory().glob("ncto_export_*"):
-        try:
-            modified_at = datetime.fromtimestamp(file_path.stat().st_mtime)
-            if modified_at < cutoff:
-                file_path.unlink(missing_ok=True)
-        except OSError:
-            continue
-
-
-# ============================================================
-# 5. AUTHENTICATION
-# ============================================================
-
-def verify_password(plain_password: str, password_hash: str) -> bool:
-    """Validate a plaintext password against a bcrypt hash."""
-    if not plain_password or not password_hash:
-        return False
+def verify_password(
+    plain_password,
+    password_hash
+):
 
     try:
+
+        if isinstance(
+            password_hash,
+            bytes
+        ):
+            stored_hash = password_hash
+
+        else:
+            stored_hash = str(
+                password_hash
+            ).encode(
+                "utf-8"
+            )
+
         return bcrypt.checkpw(
-            plain_password.encode("utf-8"),
-            password_hash.encode("utf-8"),
+            plain_password.encode(
+                "utf-8"
+            ),
+            stored_hash
         )
-    except (TypeError, ValueError):
+
+    except Exception:
         return False
 
 
 def authenticate_user(
-    username: str,
-    password: str,
-) -> Optional[dict[str, str]]:
-    """Authenticate an active state officer."""
-    if not username or not password:
-        return None
+    username,
+    password
+):
 
-    query = text(
-        """
+    query = text("""
         SELECT
             username,
             password_hash,
             assigned_state
         FROM ben.state_officer_users
-        WHERE LOWER(username) = LOWER(:username)
+        WHERE LOWER(BTRIM(username))
+              = LOWER(BTRIM(:username))
           AND is_active = TRUE
         LIMIT 1;
-        """
-    )
+    """)
 
-    try:
-        with get_engine().connect() as connection:
-            user = connection.execute(
-                query,
-                {"username": username.strip()},
-            ).mappings().first()
+    with engine.connect() as conn:
 
-        if not user:
-            return None
+        user = conn.execute(
+            query,
+            {
+                "username": username
+            }
+        ).mappings().first()
 
-        if not verify_password(password, user["password_hash"]):
-            return None
-
-        return {
-            "username": str(user["username"]),
-            "state": str(user["assigned_state"]),
-        }
-
-    except Exception as exc:
-        st.error(f"Database error during login: {exc}")
+    if not user:
         return None
 
+    if not verify_password(
+        password,
+        user["password_hash"]
+    ):
+        return None
 
-# ============================================================
-# 6. SESSION AND COOKIE MANAGEMENT
-# ============================================================
-
-def initialize_session_state() -> stx.CookieManager:
-    """Initialize all persistent session keys."""
-    defaults: dict[str, Any] = {
-        "logged_in": False,
-        "logged_in_user": None,
-        "assigned_state": None,
-        "search_results": None,
-        "search_parameters": None,
-        "full_export_path": None,
-        "full_export_rows": None,
-        "full_export_state": None,
+    return {
+        "username": user["username"],
+        "state": str(
+            user["assigned_state"]
+        ).strip()
     }
 
-    for key, default_value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = default_value
-
-    if "cookie_manager" not in st.session_state:
-        st.session_state.cookie_manager = stx.CookieManager()
-
-    return st.session_state.cookie_manager
-
-
-def restore_session_from_cookies(
-    cookie_manager: stx.CookieManager,
-) -> None:
-    """Restore a saved browser session only when no session is active."""
-    if st.session_state.logged_in:
-        return
-
-    saved_username = cookie_manager.get(cookie="ncto_logged_in_user")
-    saved_state = cookie_manager.get(cookie="ncto_user_state")
-
-    if saved_username and saved_state:
-        st.session_state.logged_in = True
-        st.session_state.logged_in_user = saved_username
-        st.session_state.assigned_state = saved_state
-
-
-def save_session_cookies(
-    cookie_manager: stx.CookieManager,
-    username: str,
-    assigned_state: str,
-) -> None:
-    """Save login cookies for seven days."""
-    max_age = 7 * 24 * 60 * 60
-
-    cookie_manager.set(
-        "ncto_logged_in_user",
-        username,
-        max_age=max_age,
-        key="set_cookie_username",
-    )
-    cookie_manager.set(
-        "ncto_user_state",
-        assigned_state,
-        max_age=max_age,
-        key="set_cookie_state",
-    )
-
-
-def logout(cookie_manager: stx.CookieManager) -> None:
-    """Remove cookies and clear user-specific session data."""
-    cookie_manager.delete(
-        "ncto_logged_in_user",
-        key="delete_cookie_username",
-    )
-    cookie_manager.delete(
-        "ncto_user_state",
-        key="delete_cookie_state",
-    )
-
-    export_path = st.session_state.get("full_export_path")
-    if export_path:
-        try:
-            Path(export_path).unlink(missing_ok=True)
-        except OSError:
-            pass
-
-    for key in list(st.session_state.keys()):
-        if key != "cookie_manager":
-            del st.session_state[key]
-
-    st.session_state.logged_in = False
-
-
-def render_login_page(cookie_manager: stx.CookieManager) -> None:
-    """Render a compact login form."""
-    left, middle, right = st.columns([1, 1.3, 1])
-
-    with middle:
-        st.title("🔐 NCTO State MIS Login")
-        st.caption("Sign in with your assigned State Officer account.")
-
-        with st.form("login_form"):
-            username = st.text_input("Username")
-            password = st.text_input("Password", type="password")
-            submitted = st.form_submit_button(
-                "Login",
-                use_container_width=True,
-            )
-
-        if submitted:
-            user = authenticate_user(username.strip(), password)
-
-            if not user:
-                st.error("Invalid username or password.")
-                st.stop()
-
-            st.session_state.logged_in = True
-            st.session_state.logged_in_user = user["username"]
-            st.session_state.assigned_state = user["state"]
-
-            save_session_cookies(
-                cookie_manager,
-                user["username"],
-                user["state"],
-            )
-
-            time.sleep(0.2)
-            st.rerun()
-
-    st.stop()
-
 
 # ============================================================
-# 7. SUMMARY QUERIES
+# STATE SUMMARY
 # ============================================================
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def load_state_summary(state_name: str) -> pd.DataFrame:
-    """
-    Load only state/tranche aggregates.
+@st.cache_data(
+    ttl=600,
+    show_spinner=False
+)
+def load_state_summary(state_name):
 
-    Each table is filtered before UNION ALL. This avoids building a national
-    three-table CTE before applying the state condition.
-    """
-    query = text(
-        """
-        WITH state_payments AS (
+    query = text("""
+        WITH unified_payments AS
+        (
             SELECT
                 'First Tranche'::TEXT AS tranche,
-                ben.normalize_location_name("State") AS state,
                 ben.normalize_location_name("LGA") AS lga,
                 ben.normalize_location_name("Ward") AS ward,
                 ben.normalize_location_name("Community") AS community,
-                CAST(nidhh AS TEXT) AS nidhh,
-                COALESCE(CAST("AmountPaid" AS NUMERIC), 0) AS amount_paid
+                CAST(nidhh AS TEXT) AS nidhh
             FROM ben."itblDistinctPaidBeneficiaries"
-            WHERE ben.normalize_location_name("State")
-                  = ben.normalize_location_name(:state_name)
+            WHERE UPPER(BTRIM("State"))
+                  = UPPER(BTRIM(:state_name))
 
             UNION ALL
 
             SELECT
-                'Second Tranche'::TEXT AS tranche,
-                ben.normalize_location_name("State") AS state,
-                ben.normalize_location_name("LGA") AS lga,
-                ben.normalize_location_name("Ward") AS ward,
-                ben.normalize_location_name("Community") AS community,
-                CAST(nidhh AS TEXT) AS nidhh,
-                COALESCE(CAST("AmountPaid" AS NUMERIC), 0) AS amount_paid
+                'Second Tranche'::TEXT,
+                ben.normalize_location_name("LGA"),
+                ben.normalize_location_name("Ward"),
+                ben.normalize_location_name("Community"),
+                CAST(nidhh AS TEXT)
             FROM ben."itblDistinctSecondTranche"
-            WHERE ben.normalize_location_name("State")
-                  = ben.normalize_location_name(:state_name)
+            WHERE UPPER(BTRIM("State"))
+                  = UPPER(BTRIM(:state_name))
 
             UNION ALL
 
             SELECT
-                'Third Tranche'::TEXT AS tranche,
-                ben.normalize_location_name("State") AS state,
-                ben.normalize_location_name("LGA") AS lga,
-                ben.normalize_location_name("Ward") AS ward,
-                ben.normalize_location_name("Community") AS community,
-                CAST(nidhh AS TEXT) AS nidhh,
-                COALESCE(CAST("AmountPaid" AS NUMERIC), 0) AS amount_paid
+                'Third Tranche'::TEXT,
+                ben.normalize_location_name("LGA"),
+                ben.normalize_location_name("Ward"),
+                ben.normalize_location_name("Community"),
+                CAST(nidhh AS TEXT)
             FROM ben."itblDistinctThirdTranche"
-            WHERE ben.normalize_location_name("State")
-                  = ben.normalize_location_name(:state_name)
+            WHERE UPPER(BTRIM("State"))
+                  = UPPER(BTRIM(:state_name))
         )
+
         SELECT
             tranche,
-            MIN(state) AS state,
-            COUNT(DISTINCT nidhh) AS total_households,
-            COUNT(DISTINCT nidhh) AS total_beneficiaries,
-            COALESCE(SUM(amount_paid), 0) AS total_amount_paid,
-            COUNT(DISTINCT lga) FILTER (WHERE lga IS NOT NULL) AS total_lgas,
+
+            COUNT(DISTINCT nidhh)
+                AS total_beneficiaries,
+
+            COUNT(DISTINCT nidhh)
+                AS total_households,
+
+            COUNT(DISTINCT lga)
+                AS total_lgas,
+
             COUNT(DISTINCT (lga, ward))
-                FILTER (WHERE lga IS NOT NULL AND ward IS NOT NULL)
                 AS total_wards,
-            COUNT(DISTINCT (lga, ward, community))
-                FILTER (
-                    WHERE lga IS NOT NULL
-                      AND ward IS NOT NULL
-                      AND community IS NOT NULL
+
+            COUNT(
+                DISTINCT (
+                    lga,
+                    ward,
+                    community
                 )
-                AS total_communities
-        FROM state_payments
+            ) AS total_communities
+
+        FROM unified_payments
+
         GROUP BY tranche
+
         ORDER BY
             CASE tranche
                 WHEN 'First Tranche' THEN 1
@@ -468,1026 +389,2196 @@ def load_state_summary(state_name: str) -> pd.DataFrame:
                 WHEN 'Third Tranche' THEN 3
                 ELSE 4
             END;
-        """
-    )
+    """)
 
-    with get_engine().connect() as connection:
-        return pd.read_sql_query(
+    with engine.connect() as conn:
+
+        return pd.read_sql(
             query,
-            connection,
-            params={"state_name": state_name},
+            conn,
+            params={
+                "state_name": state_name
+            }
         )
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def load_state_unique_total(state_name: str) -> int:
-    """Load the number of unique households/beneficiaries across all tranches."""
-    query = text(
-        """
-        SELECT COUNT(DISTINCT nidhh)
-        FROM (
-            SELECT CAST(nidhh AS TEXT) AS nidhh
+# ============================================================
+# UNIQUE STATE TOTAL
+# ============================================================
+
+@st.cache_data(
+    ttl=600,
+    show_spinner=False
+)
+def load_state_unique_total(state_name):
+
+    query = text("""
+        SELECT
+            COUNT(DISTINCT nidhh)
+        FROM
+        (
+            SELECT
+                CAST(nidhh AS TEXT) AS nidhh
             FROM ben."itblDistinctPaidBeneficiaries"
-            WHERE ben.normalize_location_name("State")
-                  = ben.normalize_location_name(:state_name)
+            WHERE UPPER(BTRIM("State"))
+                  = UPPER(BTRIM(:state_name))
 
             UNION ALL
 
-            SELECT CAST(nidhh AS TEXT) AS nidhh
+            SELECT
+                CAST(nidhh AS TEXT)
             FROM ben."itblDistinctSecondTranche"
-            WHERE ben.normalize_location_name("State")
-                  = ben.normalize_location_name(:state_name)
+            WHERE UPPER(BTRIM("State"))
+                  = UPPER(BTRIM(:state_name))
 
             UNION ALL
 
-            SELECT CAST(nidhh AS TEXT) AS nidhh
+            SELECT
+                CAST(nidhh AS TEXT)
             FROM ben."itblDistinctThirdTranche"
-            WHERE ben.normalize_location_name("State")
-                  = ben.normalize_location_name(:state_name)
-        ) AS state_households;
-        """
-    )
+            WHERE UPPER(BTRIM("State"))
+                  = UPPER(BTRIM(:state_name))
+        ) x;
+    """)
 
-    with get_engine().connect() as connection:
-        result = connection.execute(
+    with engine.connect() as conn:
+
+        value = conn.execute(
             query,
-            {"state_name": state_name},
+            {
+                "state_name": state_name
+            }
         ).scalar()
 
-    return int(result or 0)
+    return int(
+        value or 0
+    )
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def load_lga_summary(state_name: str) -> pd.DataFrame:
-    """Load LGA aggregates only when the LGA Summary page is selected."""
-    query = text(
-        """
-        WITH state_payments AS (
+# ============================================================
+# LGA SUMMARY
+# ============================================================
+
+@st.cache_data(
+    ttl=600,
+    show_spinner=False
+)
+def load_lga_summary(state_name):
+
+    query = text("""
+        WITH unified_payments AS
+        (
             SELECT
                 'First Tranche'::TEXT AS tranche,
                 ben.normalize_location_name("LGA") AS lga,
                 ben.normalize_location_name("Ward") AS ward,
                 ben.normalize_location_name("Community") AS community,
-                CAST(nidhh AS TEXT) AS nidhh,
-                COALESCE(CAST("AmountPaid" AS NUMERIC), 0) AS amount_paid
+                CAST(nidhh AS TEXT) AS nidhh
             FROM ben."itblDistinctPaidBeneficiaries"
-            WHERE ben.normalize_location_name("State")
-                  = ben.normalize_location_name(:state_name)
+            WHERE UPPER(BTRIM("State"))
+                  = UPPER(BTRIM(:state_name))
 
             UNION ALL
 
             SELECT
-                'Second Tranche'::TEXT AS tranche,
-                ben.normalize_location_name("LGA") AS lga,
-                ben.normalize_location_name("Ward") AS ward,
-                ben.normalize_location_name("Community") AS community,
-                CAST(nidhh AS TEXT) AS nidhh,
-                COALESCE(CAST("AmountPaid" AS NUMERIC), 0) AS amount_paid
+                'Second Tranche'::TEXT,
+                ben.normalize_location_name("LGA"),
+                ben.normalize_location_name("Ward"),
+                ben.normalize_location_name("Community"),
+                CAST(nidhh AS TEXT)
             FROM ben."itblDistinctSecondTranche"
-            WHERE ben.normalize_location_name("State")
-                  = ben.normalize_location_name(:state_name)
+            WHERE UPPER(BTRIM("State"))
+                  = UPPER(BTRIM(:state_name))
 
             UNION ALL
 
             SELECT
-                'Third Tranche'::TEXT AS tranche,
-                ben.normalize_location_name("LGA") AS lga,
-                ben.normalize_location_name("Ward") AS ward,
-                ben.normalize_location_name("Community") AS community,
-                CAST(nidhh AS TEXT) AS nidhh,
-                COALESCE(CAST("AmountPaid" AS NUMERIC), 0) AS amount_paid
+                'Third Tranche'::TEXT,
+                ben.normalize_location_name("LGA"),
+                ben.normalize_location_name("Ward"),
+                ben.normalize_location_name("Community"),
+                CAST(nidhh AS TEXT)
             FROM ben."itblDistinctThirdTranche"
-            WHERE ben.normalize_location_name("State")
-                  = ben.normalize_location_name(:state_name)
+            WHERE UPPER(BTRIM("State"))
+                  = UPPER(BTRIM(:state_name))
         )
+
         SELECT
-            COALESCE(lga, 'UNKNOWN LGA') AS "LGA",
-            COUNT(DISTINCT nidhh)
-                FILTER (WHERE tranche = 'First Tranche')
-                AS "First_Tranche_Beneficiaries",
-            COUNT(DISTINCT nidhh)
-                FILTER (WHERE tranche = 'Second Tranche')
-                AS "Second_Tranche_Beneficiaries",
-            COUNT(DISTINCT nidhh)
-                FILTER (WHERE tranche = 'Third Tranche')
-                AS "Third_Tranche_Beneficiaries",
-            COUNT(DISTINCT nidhh) AS "Total_Unique_Beneficiaries",
 
             COALESCE(
-                SUM(amount_paid) FILTER (WHERE tranche = 'First Tranche'),
-                0
-            ) AS "First_Tranche_Amount",
+                lga,
+                'UNKNOWN LGA'
+            ) AS "LGA",
 
-            COALESCE(
-                SUM(amount_paid) FILTER (WHERE tranche = 'Second Tranche'),
-                0
-            ) AS "Second_Tranche_Amount",
+            COUNT(
+                DISTINCT CASE
+                    WHEN tranche = 'First Tranche'
+                    THEN nidhh
+                END
+            ) AS "First_Tranche_Beneficiaries",
 
-            COALESCE(
-                SUM(amount_paid) FILTER (WHERE tranche = 'Third Tranche'),
-                0
-            ) AS "Third_Tranche_Amount",
+            COUNT(
+                DISTINCT CASE
+                    WHEN tranche = 'Second Tranche'
+                    THEN nidhh
+                END
+            ) AS "Second_Tranche_Beneficiaries",
 
-            COALESCE(SUM(amount_paid), 0) AS "Cumulative_Amount",
+            COUNT(
+                DISTINCT CASE
+                    WHEN tranche = 'Third Tranche'
+                    THEN nidhh
+                END
+            ) AS "Third_Tranche_Beneficiaries",
 
-            COUNT(DISTINCT ward)
-                FILTER (WHERE ward IS NOT NULL)
-                AS "Total_Wards",
-            COUNT(DISTINCT (ward, community))
-                FILTER (WHERE ward IS NOT NULL AND community IS NOT NULL)
-                AS "Total_Communities"
-        FROM state_payments
+            COUNT(
+                DISTINCT nidhh
+            ) AS "Total_Unique_Beneficiaries",
+
+            COUNT(
+                DISTINCT ward
+            )
+            FILTER (
+                WHERE ward IS NOT NULL
+            ) AS "Total_Wards",
+
+            COUNT(
+                DISTINCT (
+                    ward,
+                    community
+                )
+            )
+            FILTER (
+                WHERE ward IS NOT NULL
+                  AND community IS NOT NULL
+            ) AS "Total_Communities"
+
+        FROM unified_payments
+
         GROUP BY lga
-        ORDER BY COALESCE(lga, 'UNKNOWN LGA');
-        """
-    )
 
-    with get_engine().connect() as connection:
-        return pd.read_sql_query(
+        ORDER BY
+            COALESCE(
+                lga,
+                'UNKNOWN LGA'
+            );
+    """)
+
+    with engine.connect() as conn:
+
+        return pd.read_sql(
             query,
-            connection,
-            params={"state_name": state_name},
+            conn,
+            params={
+                "state_name": state_name
+            }
         )
 
 
 # ============================================================
-# 8. SEARCH QUERY
+# BENEFICIARY DETAIL QUERY
 # ============================================================
 
-def build_search_union_sql(
-    tranche_filter: str,
-    include_search: bool,
-) -> str:
-    """Build a controlled UNION query for search preview."""
-    selected_tables = PAYMENT_TABLES
-
-    if tranche_filter != "All":
-        selected_tables = tuple(
-            item for item in PAYMENT_TABLES if item[0] == tranche_filter
-        )
+def build_detail_union_sql():
 
     branches = []
 
-    for tranche_name, table_name in selected_tables:
-        branch = f"""
+    for (
+        tranche_name,
+        table_name
+    ) in PAYMENT_TABLES:
+
+        branches.append(
+            f"""
             SELECT
-                '{tranche_name}'::TEXT AS tranche,
-                CAST("State" AS TEXT) AS "State",
-                CAST("LGA" AS TEXT) AS "LGA",
-                CAST("Ward" AS TEXT) AS "Ward",
-                CAST("Community" AS TEXT) AS "Community",
-                CAST("HouseholdID" AS TEXT) AS "HouseholdID",
-                CAST(nidhh AS TEXT) AS nidhh,
-                CAST(nid AS TEXT) AS nid,
-                CAST("Name" AS TEXT) AS "Name",
-                CAST("TelephoneNo" AS TEXT) AS "TelephoneNo",
-                CAST("Gender" AS TEXT) AS "Gender",
-                CAST("Age" AS TEXT) AS "Age",
-                CAST("HAddress" AS TEXT) AS "HAddress",
-                CAST("AccountName" AS TEXT) AS "AccountName",
-                CAST("AccountNumber" AS TEXT) AS "AccountNumber",
-                CAST("BankName" AS TEXT) AS "BankName",
-                CAST("AmountPaid" AS TEXT) AS "AmountPaid",
-                CAST("PaymentStatus" AS TEXT) AS "PaymentStatus",
-                CAST("PaymentDate" AS TEXT) AS "PaymentDate",
-                CAST("NIN" AS TEXT) AS "NIN",
-                CAST("TrancheStatus" AS TEXT) AS "TrancheStatus",
-                CAST("TotalAmount" AS TEXT) AS "TotalAmount",
-                CAST("Zone" AS TEXT) AS "Zone",
-                CAST("Ward_Class" AS TEXT) AS "Ward_Class"
-               
+
+                '{tranche_name}'::TEXT
+                    AS tranche,
+
+                CAST(
+                    "State" AS TEXT
+                ) AS "State",
+
+                ben.normalize_location_name(
+                    "LGA"
+                ) AS "LGA",
+
+                ben.normalize_location_name(
+                    "Ward"
+                ) AS "Ward",
+
+                ben.normalize_location_name(
+                    "Community"
+                ) AS "Community",
+
+                CAST(
+                    "HouseholdID" AS TEXT
+                ) AS "HouseholdID",
+
+                CAST(
+                    nidhh AS TEXT
+                ) AS nidhh,
+
+                CAST(
+                    nid AS TEXT
+                ) AS nid,
+
+                CAST(
+                    "Name" AS TEXT
+                ) AS "Name",
+
+                CAST(
+                    "TelephoneNo" AS TEXT
+                ) AS "TelephoneNo",
+
+                CAST(
+                    "Gender" AS TEXT
+                ) AS "Gender",
+
+                CAST(
+                    "Age" AS TEXT
+                ) AS "Age",
+
+                CAST(
+                    "HAddress" AS TEXT
+                ) AS "HAddress",
+
+                CAST(
+                    "AccountName" AS TEXT
+                ) AS "AccountName",
+
+                CAST(
+                    "AccountNumber" AS TEXT
+                ) AS "AccountNumber",
+
+                CAST(
+                    "BankName" AS TEXT
+                ) AS "BankName",
+
+                CAST(
+                    "AmountPaid" AS TEXT
+                ) AS "AmountPaid",
+
+                CAST(
+                    "PaymentStatus" AS TEXT
+                ) AS "PaymentStatus",
+
+                CAST(
+                    "PaymentDate" AS TEXT
+                ) AS "PaymentDate",
+
+                CAST(
+                    "TrancheStatus" AS TEXT
+                ) AS "TrancheStatus",
+
+                CAST(
+                    "TotalAmount" AS TEXT
+                ) AS "TotalAmount",
+
+                CAST(
+                    "Zone" AS TEXT
+                ) AS "Zone",
+
+                CAST(
+                    "Ward_Class" AS TEXT
+                ) AS "Ward_Class"
+
             FROM {table_name}
-            WHERE ben.normalize_location_name("State")
-                  = ben.normalize_location_name(:state_name)
+
+            WHERE UPPER(BTRIM("State"))
+                  = UPPER(BTRIM(:state_name))
+            """
+        )
+
+    return "\nUNION ALL\n".join(
+        branches
+    )
+
+
+@st.cache_data(
+    ttl=300,
+    show_spinner=False
+)
+def load_state_data(
+    state_name,
+    tranche_filter,
+    search_value,
+    limit_rows
+):
+
+    params = {
+        "state_name": state_name,
+        "limit_rows": int(
+            limit_rows
+        )
+    }
+
+    tranche_condition = ""
+
+    if tranche_filter != "All":
+
+        tranche_condition = """
+            AND tranche = :tranche_filter
         """
 
-        if include_search:
-            branch += """
-                AND (
-                       CAST(nid AS TEXT) ILIKE :search_value
-                    OR CAST(nidhh AS TEXT) ILIKE :search_value
-                    OR CAST("NIN" AS TEXT) ILIKE :search_value
-                    OR CAST("AccountNumber" AS TEXT) ILIKE :search_value
-                    OR CAST("Name" AS TEXT) ILIKE :search_value
-                    OR CAST("HouseholdID" AS TEXT) ILIKE :search_value
-                )
-            """
-
-        branches.append(branch)
-
-    return "\nUNION ALL\n".join(branches)
+        params[
+            "tranche_filter"
+        ] = tranche_filter
 
 
-def search_state_data(
-    state_name: str,
-    tranche_filter: str,
-    search_value: str,
-    limit_rows: int,
-) -> pd.DataFrame:
-    """
-    Load search results into a dedicated result table.
+    search_condition = ""
 
-    This function is deliberately not cached because each search is explicitly
-    submitted through a form and saved in session state.
-    """
-    union_sql = build_search_union_sql(
-        tranche_filter=tranche_filter,
-        include_search=bool(search_value),
+    if search_value:
+
+        search_condition = """
+            AND
+            (
+                   nid ILIKE :search_value
+                OR nidhh ILIKE :search_value
+                OR "AccountNumber" ILIKE :search_value
+                OR "Name" ILIKE :search_value
+                OR "HouseholdID" ILIKE :search_value
+                OR "TelephoneNo" ILIKE :search_value
+            )
+        """
+
+        params[
+            "search_value"
+        ] = f"%{search_value}%"
+
+
+    union_sql = (
+        build_detail_union_sql()
     )
+
 
     query = text(
         f"""
-        SELECT *
-        FROM (
+        WITH unified_payments AS
+        (
             {union_sql}
-        ) AS matches
-        ORDER BY
-            tranche,
-            "LGA",
-            "Ward",
-            "Community",
-            "Name"
+        )
+
+        SELECT *
+        FROM unified_payments
+        WHERE 1 = 1
+
+        {tranche_condition}
+        {search_condition}
+
         LIMIT :limit_rows;
         """
     )
 
-    params: dict[str, Any] = {
-        "state_name": state_name,
-        "limit_rows": int(limit_rows),
-    }
+    with engine.connect() as conn:
 
-    if search_value:
-        params["search_value"] = f"%{search_value.strip()}%"
-
-    with get_engine().connect() as connection:
-        return pd.read_sql_query(query, connection, params=params)
+        return pd.read_sql(
+            query,
+            conn,
+            params=params
+        )
 
 
 # ============================================================
-# 9. HIGH-PERFORMANCE FULL EXPORT
+# FULL EXPORT SQL
+#
+# No NIN
+# No NINBVN
+# No IDType
+# No AccountUsed
+#
+# Includes:
+# HAddress
+# TelephoneNo
+# TrancheStatus
+# Zone
+# Ward_Class
 # ============================================================
 
-def build_full_export_select_sql() -> str:
-    """
-    Build the full export SELECT.
+def build_full_export_select_sql():
 
-    Important optimizations:
-    - State filtering happens inside each table branch.
-    - There is no ORDER BY. Sorting millions of rows before export is expensive
-      and does not add value to a raw full-detail download.
-    - PostgreSQL COPY writes rows directly to disk without pandas or StringIO.
-    """
     branches = []
 
-    for tranche_name, table_name in PAYMENT_TABLES:
+    for (
+        tranche_name,
+        table_name
+    ) in PAYMENT_TABLES:
+
         branches.append(
             f"""
             SELECT
-                '{tranche_name}'::TEXT AS tranche,
-                CAST("State" AS TEXT) AS "State",
-                CAST("LGA" AS TEXT) AS "LGA",
-                CAST("Ward" AS TEXT) AS "Ward",
-                CAST("Community" AS TEXT) AS "Community",
-                CAST("HouseholdID" AS TEXT) AS "HouseholdID",
-                CAST(nidhh AS TEXT) AS nidhh,
-                CAST(nid AS TEXT) AS nid,
-                CAST("Name" AS TEXT) AS "Name",
-                CAST("TelephoneNo" AS TEXT) AS "TelephoneNo",
-                CAST("Gender" AS TEXT) AS "Gender",
-                CAST("Age" AS TEXT) AS "Age",
-                CAST("HAddress" AS TEXT) AS "HAddress",
-                CAST("AccountName" AS TEXT) AS "AccountName",
-                CAST("AccountNumber" AS TEXT) AS "AccountNumber",
-                CAST("BankName" AS TEXT) AS "BankName",
-                CAST("AmountPaid" AS TEXT) AS "AmountPaid",
-                CAST("PaymentStatus" AS TEXT) AS "PaymentStatus",
-                CAST("PaymentDate" AS TEXT) AS "PaymentDate",
-                CAST("TrancheStatus" AS TEXT) AS "TrancheStatus",
-                CAST("TotalAmount" AS TEXT) AS "TotalAmount",
-                CAST("Zone" AS TEXT) AS "Zone",
-                CAST("Ward_Class" AS TEXT) AS "Ward_Class"
-                
+
+                '{tranche_name}'::TEXT
+                    AS tranche,
+
+                CAST(
+                    "State" AS TEXT
+                ) AS "State",
+
+                ben.normalize_location_name(
+                    "LGA"
+                ) AS "LGA",
+
+                ben.normalize_location_name(
+                    "Ward"
+                ) AS "Ward",
+
+                ben.normalize_location_name(
+                    "Community"
+                ) AS "Community",
+
+                CAST(
+                    "HouseholdID" AS TEXT
+                ) AS "HouseholdID",
+
+                CAST(
+                    nidhh AS TEXT
+                ) AS nidhh,
+
+                CAST(
+                    nid AS TEXT
+                ) AS nid,
+
+                CAST(
+                    "Name" AS TEXT
+                ) AS "Name",
+
+                CAST(
+                    "TelephoneNo" AS TEXT
+                ) AS "TelephoneNo",
+
+                CAST(
+                    "Gender" AS TEXT
+                ) AS "Gender",
+
+                CAST(
+                    "Age" AS TEXT
+                ) AS "Age",
+
+                CAST(
+                    "HAddress" AS TEXT
+                ) AS "HAddress",
+
+                CAST(
+                    "AccountName" AS TEXT
+                ) AS "AccountName",
+
+                CAST(
+                    "AccountNumber" AS TEXT
+                ) AS "AccountNumber",
+
+                CAST(
+                    "BankName" AS TEXT
+                ) AS "BankName",
+
+                CAST(
+                    "AmountPaid" AS TEXT
+                ) AS "AmountPaid",
+
+                CAST(
+                    "PaymentStatus" AS TEXT
+                ) AS "PaymentStatus",
+
+                CAST(
+                    "PaymentDate" AS TEXT
+                ) AS "PaymentDate",
+
+                CAST(
+                    "TrancheStatus" AS TEXT
+                ) AS "TrancheStatus",
+
+                CAST(
+                    "TotalAmount" AS TEXT
+                ) AS "TotalAmount",
+
+                CAST(
+                    "Zone" AS TEXT
+                ) AS "Zone",
+
+                CAST(
+                    "Ward_Class" AS TEXT
+                ) AS "Ward_Class"
+
             FROM {table_name}
-            WHERE ben.normalize_location_name("State")
-                  = ben.normalize_location_name(%s)
+
+            WHERE UPPER(BTRIM("State"))
+                  = UPPER(BTRIM(%s))
             """
         )
 
-    return "\nUNION ALL\n".join(branches)
-
-
-def prepare_full_state_export(
-    state_name: str,
-    compress_file: bool = True,
-) -> tuple[str, int]:
-    """
-    Stream a complete state export from PostgreSQL directly into a server file.
-
-    PostgreSQL COPY is significantly faster and more memory-efficient than:
-        pandas.read_sql(..., chunksize=...)
-        -> DataFrame conversion
-        -> StringIO concatenation
-        -> st.download_button
-
-    Returns:
-        (generated_file_path, approximate_row_count)
-    """
-    cleanup_old_export_files()
-
-    safe_state = normalize_filename(state_name).lower()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    suffix = ".csv.gz" if compress_file else ".csv"
-
-    output_path = (
-        get_export_directory()
-        / f"ncto_export_{safe_state}_{timestamp}{suffix}"
+    return "\nUNION ALL\n".join(
+        branches
     )
 
-    select_sql = build_full_export_select_sql()
-    engine = get_engine()
-    raw_connection = engine.raw_connection()
 
-    try:
-        cursor = raw_connection.cursor()
+# ============================================================
+# EXPORT STATUS LOCK
+# ============================================================
 
-        # Safely insert the same state parameter into all three UNION branches.
-        rendered_select = cursor.mogrify(
-            select_sql,
-            (state_name, state_name, state_name),
-        ).decode("utf-8")
+STATUS_FILE_LOCK = threading.RLock()
 
-        copy_sql = (
-            f"COPY ({rendered_select}) "
-            "TO STDOUT WITH (FORMAT CSV, HEADER TRUE, ENCODING 'UTF8')"
+
+# ============================================================
+# EXPORT STATUS FILE
+# ============================================================
+
+def get_export_status_file(state_name):
+
+    return (
+        EXPORT_DIR
+        / f"{safe_filename(state_name)}_Full_Export.status.json"
+    )
+
+
+# ============================================================
+# WRITE EXPORT STATUS
+#
+# Windows-safe:
+# - no .tmp file
+# - no os.replace()
+# - no rename
+# - protected by thread lock
+# - retries if antivirus/Windows temporarily locks the file
+# ============================================================
+
+def write_export_status(
+    state_name,
+    status,
+    **kwargs
+):
+
+    status_file = get_export_status_file(
+        state_name
+    )
+
+    data = {
+        "state": state_name,
+        "status": status,
+        "updated_at": datetime.now().isoformat(
+            timespec="seconds"
         )
+    }
 
-        if compress_file:
-            with gzip.open(
-                output_path,
-                mode="wt",
-                encoding="utf-8-sig",
-                newline="",
-                compresslevel=5,
-            ) as output_file:
-                cursor.copy_expert(copy_sql, output_file)
-        else:
-            with open(
-                output_path,
-                mode="w",
-                encoding="utf-8-sig",
-                newline="",
-            ) as output_file:
-                cursor.copy_expert(copy_sql, output_file)
+    data.update(kwargs)
 
-        raw_connection.commit()
-        cursor.close()
-
-    except Exception:
-        raw_connection.rollback()
-        output_path.unlink(missing_ok=True)
-        raise
-
-    finally:
-        raw_connection.close()
-
-    # Counting lines in a compressed multi-million-row file would add another
-    # long scan. Use the already cached state unique total as the displayed
-    # beneficiary estimate instead.
-    estimated_rows = load_state_unique_total(state_name)
-    return str(output_path), estimated_rows
-
-
-def open_export_file(file_path: str) -> BinaryIO:
-    """Open a prepared export for Streamlit's download button."""
-    return open(file_path, "rb")
-
-
-def find_reusable_state_export(
-    state_name: str,
-    prefer_compressed: bool = True,
-) -> Optional[str]:
-    """
-    Return the newest valid export already prepared for this state.
-
-    A prepared file is shared across officer sessions on the same Render
-    instance. This prevents every officer from launching the same expensive
-    database export independently.
-    """
-    safe_state = normalize_filename(state_name).lower()
-    expected_suffix = ".csv.gz" if prefer_compressed else ".csv"
-    cutoff = datetime.now() - timedelta(hours=EXPORT_REUSE_HOURS)
-
-    candidates = sorted(
-        get_export_directory().glob(
-            f"ncto_export_{safe_state}_*{expected_suffix}"
-        ),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
+    EXPORT_DIR.mkdir(
+        parents=True,
+        exist_ok=True
     )
 
-    for candidate in candidates:
-        try:
-            modified_at = datetime.fromtimestamp(candidate.stat().st_mtime)
+    last_error = None
 
-            if modified_at >= cutoff and candidate.stat().st_size > 0:
-                return str(candidate)
-        except OSError:
-            continue
+    with STATUS_FILE_LOCK:
+
+        for attempt in range(10):
+
+            try:
+
+                with open(
+                    status_file,
+                    "w",
+                    encoding="utf-8"
+                ) as file:
+
+                    json.dump(
+                        data,
+                        file,
+                        indent=2
+                    )
+
+                    file.flush()
+
+                return True
+
+            except PermissionError as exc:
+
+                last_error = exc
+
+                time.sleep(
+                    0.25 * (attempt + 1)
+                )
+
+            except OSError as exc:
+
+                last_error = exc
+
+                time.sleep(
+                    0.25 * (attempt + 1)
+                )
+
+    raise RuntimeError(
+        f"Unable to write export status after retries: "
+        f"{last_error}"
+    )
+
+
+# ============================================================
+# READ EXPORT STATUS
+# ============================================================
+
+def read_export_status(state_name):
+
+    status_file = get_export_status_file(
+        state_name
+    )
+
+    if not status_file.exists():
+        return None
+
+    with STATUS_FILE_LOCK:
+
+        for attempt in range(5):
+
+            try:
+
+                with open(
+                    status_file,
+                    "r",
+                    encoding="utf-8"
+                ) as file:
+
+                    return json.load(file)
+
+            except json.JSONDecodeError:
+
+                # Extremely small chance that another thread
+                # is between truncate/write operations.
+                time.sleep(0.1)
+
+            except PermissionError:
+
+                time.sleep(
+                    0.15 * (attempt + 1)
+                )
+
+            except OSError:
+
+                time.sleep(
+                    0.15 * (attempt + 1)
+                )
 
     return None
 
 
-def deferred_export_reader(file_path: str):
-    """
-    Return a zero-argument callable for st.download_button.
+# ============================================================
+# GZIP VALIDATION
+# ============================================================
 
-    Streamlit executes the callable only when the officer clicks Download.
-    Returning a buffered file object avoids loading the full export during
-    every page rerun.
-    """
-    def _reader():
-        return open(file_path, "rb")
+def validate_gzip_file(
+    file_path
+):
 
-    return _reader
+    file_path = Path(
+        file_path
+    )
+
+    if not file_path.exists():
+        return False
+
+    if file_path.stat().st_size <= 0:
+        return False
+
+    try:
+
+        with gzip.open(
+            file_path,
+            "rb"
+        ) as file:
+
+            while True:
+
+                chunk = file.read(
+                    8 * 1024 * 1024
+                )
+
+                if not chunk:
+                    break
+
+        return True
+
+    except Exception:
+
+        return False
 
 
-def clear_current_export() -> None:
-    """Delete the current session's generated export."""
-    export_path = st.session_state.get("full_export_path")
+# ============================================================
+# CLEAN OLD EXPORTS
+# ============================================================
 
-    if export_path:
+def cleanup_old_exports(
+    state_name,
+    keep_file=None
+):
+
+    state_prefix = (
+        safe_filename(
+            state_name
+        )
+        + "_Full_Beneficiaries_"
+    )
+
+    for file in EXPORT_DIR.glob(
+        f"{state_prefix}*.csv.gz"
+    ):
+
+        if (
+            keep_file
+            and file.resolve()
+            == Path(
+                keep_file
+            ).resolve()
+        ):
+            continue
+
         try:
-            Path(export_path).unlink(missing_ok=True)
-        except OSError:
+            file.unlink()
+        except Exception:
             pass
 
-    st.session_state.full_export_path = None
-    st.session_state.full_export_rows = None
-    st.session_state.full_export_state = None
-
 
 # ============================================================
-# 10. SIDEBAR NAVIGATION
+# GENERATE FULL EXPORT
 # ============================================================
 
-def render_sidebar(
-    cookie_manager: stx.CookieManager,
-    assigned_state: str,
-) -> str:
-    """Render navigation so only one data page runs per rerun."""
-    st.sidebar.title("NCTO MIS Portal")
-    st.sidebar.success(
-        f"User: {st.session_state.logged_in_user}"
-    )
-    st.sidebar.info(f"State: {assigned_state}")
+def generate_full_export_job(
+    state_name
+):
 
-    st.sidebar.markdown("---")
-
-    page = st.sidebar.radio(
-        "Navigation",
-        options=[
-            "Home",
-            "State Summary",
-            "LGA Summary",
-            "Beneficiary Search",
-            "Full Details Export",
-        ],
-        captions=[
-            "Portal overview",
-            "State and tranche metrics",
-            "LGA-level distribution",
-            "Search without reloading summaries",
-            "Prepare the complete CSV file",
-        ],
+    timestamp = datetime.now().strftime(
+        "%Y%m%d_%H%M%S"
     )
 
-    st.sidebar.markdown("---")
-
-    if st.sidebar.button("Logout", use_container_width=True):
-        logout(cookie_manager)
-        time.sleep(0.2)
-        st.rerun()
-
-    return page
-
-
-# ============================================================
-# 11. PAGE RENDERERS
-# ============================================================
-
-def render_home_page(assigned_state: str) -> None:
-    """Render a lightweight landing page with no payment-table query."""
-    st.title("NCTO State Officer Portal")
-    st.subheader(f"{assigned_state} State")
-
-    st.info(
-        "Select a function from the sidebar. Each section now loads separately, "
-        "so opening the portal does not automatically run all summary, search, "
-        "and export queries."
+    safe_state = safe_filename(
+        state_name
     )
 
-    col1, col2, col3 = st.columns(3)
+    filename = (
+        f"{safe_state}"
+        f"_Full_Beneficiaries_"
+        f"{timestamp}.csv.gz"
+    )
 
-    with col1:
-        st.markdown("#### State Summary")
-        st.write("View tranche, household, LGA, ward, and community totals.")
+    final_path = (
+        EXPORT_DIR
+        / filename
+    )
 
-    with col2:
-        st.markdown("#### Beneficiary Search")
-        st.write("Search a separate result table without recalculating summaries.")
+    partial_path = Path(
+        str(
+            final_path
+        )
+        + ".part"
+    )
 
-    with col3:
-        st.markdown("#### Full Export")
-        st.write("Prepare a compressed CSV directly from PostgreSQL.")
-
-
-def render_state_summary_page(assigned_state: str) -> None:
-    """Render only the state summary query and its download."""
-    st.title("State Summary")
-    st.caption(f"Payment summary for {assigned_state} State")
+    raw_connection = None
+    cursor = None
 
     try:
-        with st.spinner("Loading state summary..."):
-            summary_df = load_state_summary(assigned_state)
-            unique_total = load_state_unique_total(assigned_state)
 
-    except Exception as exc:
-        st.error(f"Unable to load the state summary: {exc}")
-        return
+        # ----------------------------------------------------
+        # STATUS RUNNING
+        # ----------------------------------------------------
 
-    if summary_df.empty:
-        st.warning("No state summary was found.")
-        return
-
-    cumulative_amount = float(summary_df["total_amount_paid"].sum())
-
-    metric1, metric2, metric3, metric4 = st.columns(4)
-    metric1.metric("Total Beneficiaries", f"{unique_total:,}")
-    metric2.metric("Total Households", f"{unique_total:,}")
-    metric3.metric(
-        "Tranches Available",
-        f"{summary_df['tranche'].nunique():,}",
-    )
-    metric4.metric(
-        "Cumulative Amount Paid",
-        f"₦{cumulative_amount:,.2f}",
-    )
-
-    display_summary_df = summary_df.rename(
-        columns={
-            "tranche": "Tranche",
-            "state": "State",
-            "total_households": "Total Households",
-            "total_beneficiaries": "Total Beneficiaries",
-            "total_amount_paid": "Amount Paid (₦)",
-            "total_lgas": "Total LGAs",
-            "total_wards": "Total Wards",
-            "total_communities": "Total Communities",
-        }
-    )
-
-    st.dataframe(
-        display_summary_df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Amount Paid (₦)": st.column_config.NumberColumn(
-                "Amount Paid (₦)",
-                format="₦%.2f",
+        write_export_status(
+            state_name,
+            "running",
+            started_at=datetime.now().isoformat(
+                timespec="seconds"
             ),
-        },
-    )
-
-    summary_excel = dataframe_to_excel_bytes(
-        display_summary_df,
-        "State Summary",
-    )
-
-    st.download_button(
-        label="Download State Summary",
-        data=summary_excel,
-        file_name=(
-            f"{normalize_filename(assigned_state)}_State_Summary.xlsx"
-        ),
-        mime=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
-        use_container_width=True,
-    )
-
-
-def render_lga_summary_page(assigned_state: str) -> None:
-    """Render only the LGA summary query and its download."""
-    st.title("LGA Summary")
-    st.caption(f"LGA-level payment distribution for {assigned_state} State")
-
-    try:
-        with st.spinner("Loading LGA summary..."):
-            lga_df = load_lga_summary(assigned_state)
-
-    except Exception as exc:
-        st.error(f"Unable to load the LGA summary: {exc}")
-        return
-
-    if lga_df.empty:
-        st.warning("No LGA summary was found.")
-        return
-
-    cumulative_amount = float(lga_df["Cumulative_Amount"].sum())
-
-    metric1, metric2, metric3, metric4 = st.columns(4)
-    metric1.metric("LGAs", f"{len(lga_df):,}")
-    metric2.metric(
-        "Unique Beneficiaries",
-        f"{int(lga_df['Total_Unique_Beneficiaries'].sum()):,}",
-    )
-    metric3.metric(
-        "Communities",
-        f"{int(lga_df['Total_Communities'].sum()):,}",
-    )
-    metric4.metric(
-        "Cumulative Amount Paid",
-        f"₦{cumulative_amount:,.2f}",
-    )
-
-    st.dataframe(
-        lga_df,
-        use_container_width=True,
-        hide_index=True,
-        height=600,
-        column_config={
-            "First_Tranche_Amount": st.column_config.NumberColumn(
-                "First Tranche Amount (₦)",
-                format="₦%.2f",
-            ),
-            "Second_Tranche_Amount": st.column_config.NumberColumn(
-                "Second Tranche Amount (₦)",
-                format="₦%.2f",
-            ),
-            "Third_Tranche_Amount": st.column_config.NumberColumn(
-                "Third Tranche Amount (₦)",
-                format="₦%.2f",
-            ),
-            "Cumulative_Amount": st.column_config.NumberColumn(
-                "Cumulative Amount (₦)",
-                format="₦%.2f",
-            ),
-        },
-    )
-
-    lga_excel = dataframe_to_excel_bytes(
-        lga_df,
-        "LGA Summary",
-    )
-
-    st.download_button(
-        label="Download LGA Summary",
-        data=lga_excel,
-        file_name=(
-            f"{normalize_filename(assigned_state)}_LGA_Summary.xlsx"
-        ),
-        mime=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
-        use_container_width=True,
-    )
-
-
-def render_search_page(assigned_state: str) -> None:
-    """
-    Render a standalone search page.
-
-    Results are stored in session state. They do not affect or trigger the
-    state/LGA summary functions.
-    """
-    st.title("Beneficiary Search")
-    st.caption(
-        "Search results are displayed in a separate table and do not "
-        "recalculate the summary pages."
-    )
-
-    with st.form("beneficiary_search_form"):
-        filter_col1, filter_col2, filter_col3 = st.columns([1, 2, 1])
-
-        with filter_col1:
-            tranche_filter = st.selectbox(
-                "Tranche",
-                [
-                    "All",
-                    "First Tranche",
-                    "Second Tranche",
-                    "Third Tranche",
-                ],
+            message=(
+                "Full state export is currently being prepared."
             )
-
-        with filter_col2:
-            search_value = st.text_input(
-                "Search",
-                placeholder=(
-                    "NID, NIDHH, NIN, account number, name, or household ID"
-                ),
-            )
-
-        with filter_col3:
-            limit_rows = st.number_input(
-                "Maximum result rows",
-                min_value=100,
-                max_value=SEARCH_MAX_LIMIT,
-                value=SEARCH_DEFAULT_LIMIT,
-                step=500,
-            )
-
-        search_submitted = st.form_submit_button(
-            "Run Search",
-            use_container_width=True,
         )
 
-    if search_submitted:
-        if not search_value.strip():
-            st.warning(
-                "Enter a search value. Loading an unfiltered detail table "
-                "is disabled on the search page to protect performance."
-            )
-        else:
+
+        # ----------------------------------------------------
+        # REMOVE STALE PART FILE
+        # ----------------------------------------------------
+
+        if partial_path.exists():
+
             try:
-                with st.spinner("Searching beneficiary records..."):
-                    results = search_state_data(
-                        state_name=assigned_state,
-                        tranche_filter=tranche_filter,
-                        search_value=search_value,
-                        limit_rows=int(limit_rows),
-                    )
+                partial_path.unlink()
+            except Exception:
+                pass
 
-                st.session_state.search_results = results
-                st.session_state.search_parameters = {
-                    "tranche": tranche_filter,
-                    "search": search_value,
-                    "limit": int(limit_rows),
-                }
 
-            except Exception as exc:
-                st.error(f"Search failed: {exc}")
+        # ----------------------------------------------------
+        # BUILD COPY QUERY
+        # ----------------------------------------------------
 
-    results = st.session_state.get("search_results")
-    parameters = st.session_state.get("search_parameters")
+        select_sql = (
+            build_full_export_select_sql()
+        )
 
-    if isinstance(results, pd.DataFrame):
-        st.markdown("---")
+        copy_sql = f"""
+            COPY
+            (
+                {select_sql}
+            )
+            TO STDOUT
+            WITH
+            (
+                FORMAT CSV,
+                HEADER TRUE,
+                ENCODING 'UTF8'
+            )
+        """
 
-        if results.empty:
-            st.info("No matching beneficiary record was found.")
+
+        # ----------------------------------------------------
+        # RAW POSTGRES CONNECTION
+        # ----------------------------------------------------
+
+        raw_connection = (
+            engine.raw_connection()
+        )
+
+        cursor = (
+            raw_connection.cursor()
+        )
+
+
+        parameters = tuple(
+            state_name
+            for _ in PAYMENT_TABLES
+        )
+
+
+        final_copy_sql = (
+            cursor.mogrify(
+                copy_sql,
+                parameters
+            )
+            .decode(
+                "utf-8"
+            )
+        )
+
+
+        # ----------------------------------------------------
+        # COPY DIRECTLY TO GZIP
+        # ----------------------------------------------------
+
+        with gzip.open(
+            partial_path,
+            mode="wb",
+            compresslevel=5
+        ) as gzip_file:
+
+            # UTF-8 BOM
+            gzip_file.write(
+                b"\xef\xbb\xbf"
+            )
+
+            cursor.copy_expert(
+                final_copy_sql,
+                gzip_file,
+                size=8 * 1024 * 1024
+            )
+
+
+        cursor.close()
+        cursor = None
+
+        raw_connection.close()
+        raw_connection = None
+
+
+        # ----------------------------------------------------
+        # VALIDATE BEFORE READY
+        # ----------------------------------------------------
+
+        if not validate_gzip_file(
+            partial_path
+        ):
+
+            raise RuntimeError(
+                "Generated export failed GZIP integrity validation."
+            )
+
+
+        # ----------------------------------------------------
+        # ATOMIC COMPLETION
+        # ----------------------------------------------------
+
+        os.replace(
+            partial_path,
+            final_path
+        )
+
+
+        # ----------------------------------------------------
+        # REMOVE PREVIOUS COMPLETED EXPORTS
+        # ----------------------------------------------------
+
+        cleanup_old_exports(
+            state_name,
+            keep_file=final_path
+        )
+
+
+        size_bytes = (
+            final_path.stat().st_size
+        )
+
+        size_mb = (
+            size_bytes
+            / 1024
+            / 1024
+        )
+
+
+        # ----------------------------------------------------
+        # READY
+        # ----------------------------------------------------
+
+        write_export_status(
+            state_name,
+            "ready",
+            filename=final_path.name,
+            filepath=str(
+                final_path
+            ),
+            file_size_bytes=size_bytes,
+            file_size_mb=round(
+                size_mb,
+                2
+            ),
+            completed_at=datetime.now().isoformat(
+                timespec="seconds"
+            )
+        )
+
+        return True
+
+
+    except Exception as exc:
+
+        try:
+
+            if cursor is not None:
+                cursor.close()
+
+        except Exception:
+            pass
+
+
+        try:
+
+            if raw_connection is not None:
+                raw_connection.close()
+
+        except Exception:
+            pass
+
+
+        try:
+
+            if partial_path.exists():
+                partial_path.unlink()
+
+        except Exception:
+            pass
+
+
+        write_export_status(
+            state_name,
+            "failed",
+            error=str(
+                exc
+            ),
+            failed_at=datetime.now().isoformat(
+                timespec="seconds"
+            )
+        )
+
+        return False
+
+
+# ============================================================
+# START BACKGROUND EXPORT
+# ============================================================
+
+def start_full_export(
+    state_name
+):
+
+    jobs = (
+        get_export_jobs()
+    )
+
+    lock = (
+        get_export_lock()
+    )
+
+    state_key = (
+        str(
+            state_name
+        )
+        .strip()
+        .upper()
+    )
+
+
+    with lock:
+
+        existing = (
+            jobs.get(
+                state_key
+            )
+        )
+
+        if (
+            existing is not None
+            and not existing.done()
+        ):
+
+            return (
+                False,
+                "An export is already running for this state."
+            )
+
+
+        executor = (
+            get_export_executor()
+        )
+
+        future = executor.submit(
+            generate_full_export_job,
+            state_name
+        )
+
+        jobs[
+            state_key
+        ] = future
+
+
+    return (
+        True,
+        "Full state export started."
+    )
+
+
+# ============================================================
+# SIGNED DOWNLOAD TOKEN
+# ============================================================
+
+def create_download_token(
+    filename
+):
+
+    expires = int(
+        time.time()
+        + DOWNLOAD_TOKEN_LIFETIME
+    )
+
+    payload = (
+        f"{filename}|{expires}"
+    )
+
+    signature = hmac.new(
+        DOWNLOAD_SECRET.encode(
+            "utf-8"
+        ),
+        payload.encode(
+            "utf-8"
+        ),
+        hashlib.sha256
+    ).hexdigest()
+
+    raw_token = (
+        f"{payload}|{signature}"
+    )
+
+    return (
+        base64.urlsafe_b64encode(
+            raw_token.encode(
+                "utf-8"
+            )
+        )
+        .decode(
+            "utf-8"
+        )
+    )
+
+
+def verify_download_token(
+    token
+):
+
+    try:
+
+        decoded = (
+            base64.urlsafe_b64decode(
+                token.encode(
+                    "utf-8"
+                )
+            )
+            .decode(
+                "utf-8"
+            )
+        )
+
+        filename, expiry, signature = (
+            decoded.rsplit(
+                "|",
+                2
+            )
+        )
+
+        expiry = int(
+            expiry
+        )
+
+        if time.time() > expiry:
+            return None
+
+
+        payload = (
+            f"{filename}|{expiry}"
+        )
+
+        expected_signature = hmac.new(
+            DOWNLOAD_SECRET.encode(
+                "utf-8"
+            ),
+            payload.encode(
+                "utf-8"
+            ),
+            hashlib.sha256
+        ).hexdigest()
+
+
+        if not hmac.compare_digest(
+            signature,
+            expected_signature
+        ):
+            return None
+
+
+        # Directory traversal protection
+        if Path(
+            filename
+        ).name != filename:
+
+            return None
+
+
+        return filename
+
+
+    except Exception:
+
+        return None
+
+
+# ============================================================
+# DIRECT DOWNLOAD HTTP SERVER
+# ============================================================
+
+class ExportDownloadHandler(
+    BaseHTTPRequestHandler
+):
+
+    def log_message(
+        self,
+        format,
+        *args
+    ):
+        return
+
+
+    def do_GET(self):
+
+        parsed = urlparse(
+            self.path
+        )
+
+
+        if parsed.path != "/download":
+
+            self.send_error(
+                404,
+                "Not Found"
+            )
+
             return
 
-        st.success(f"{len(results):,} matching records loaded.")
 
-        if parameters:
-            st.caption(
-                f"Tranche: {parameters['tranche']} | "
-                f"Search: {parameters['search']} | "
-                f"Limit: {parameters['limit']:,}"
+        query = parse_qs(
+            parsed.query
+        )
+
+
+        tokens = query.get(
+            "token"
+        )
+
+
+        if not tokens:
+
+            self.send_error(
+                403,
+                "Missing download token."
             )
 
-        st.dataframe(
-            results,
-            use_container_width=True,
-            hide_index=True,
-            height=620,
-        )
+            return
 
-        st.download_button(
-            label="Download Displayed Search Results",
-            data=dataframe_to_csv_bytes(results),
-            file_name=(
-                f"{normalize_filename(assigned_state)}_Search_Results.csv"
-            ),
-            mime="text/csv",
-            use_container_width=True,
+
+        filename = verify_download_token(
+            tokens[0]
         )
 
 
-def render_full_export_page(assigned_state: str) -> None:
-    """
-    Render the remote-user-safe full export page.
+        if not filename:
 
-    A recent export is reused across sessions, and the download file is opened
-    only after the officer clicks the final download button.
-    """
-    st.title("Full Beneficiary Details Export")
-    st.caption(
-        "Prepare once and download. A recent state export can be reused by "
-        "other authorized officers instead of querying the database again."
-    )
-
-    st.info(
-        "Compressed CSV.GZ is strongly recommended for remote users. It is "
-        "smaller, transfers faster, and uses less Render memory."
-    )
-
-    compress_file = st.checkbox(
-        "Compress as CSV.GZ",
-        value=True,
-        help="Recommended for large state files and remote downloads.",
-    )
-
-    current_path = st.session_state.get("full_export_path")
-    current_state = st.session_state.get("full_export_state")
-
-    if (
-        not current_path
-        or current_state != assigned_state
-        or not Path(current_path).exists()
-    ):
-        reusable_path = find_reusable_state_export(
-            assigned_state,
-            prefer_compressed=compress_file,
-        )
-
-        if reusable_path:
-            st.session_state.full_export_path = reusable_path
-            st.session_state.full_export_state = assigned_state
-            st.session_state.full_export_rows = load_state_unique_total(
-                assigned_state
+            self.send_error(
+                403,
+                "Invalid or expired download link."
             )
 
-    generate_col, refresh_col, clear_col = st.columns([2, 1, 1])
+            return
 
-    with generate_col:
-        generate_clicked = st.button(
-            "Prepare or Reuse Full State Export",
-            type="primary",
-            width="stretch",
+
+        file_path = (
+            EXPORT_DIR
+            / filename
         )
 
-    with refresh_col:
-        force_refresh_clicked = st.button(
-            "Force New Export",
-            width="stretch",
-            help="Use only when the existing export is outdated.",
-        )
 
-    with clear_col:
-        clear_clicked = st.button(
-            "Clear My Selection",
-            width="stretch",
-        )
+        if (
+            not file_path.exists()
+            or not file_path.is_file()
+        ):
 
-    if clear_clicked:
-        st.session_state.full_export_path = None
-        st.session_state.full_export_rows = None
-        st.session_state.full_export_state = None
-        st.success("Your prepared export selection was cleared.")
-        st.rerun()
-
-    prepare_new_export = force_refresh_clicked
-
-    if generate_clicked:
-        reusable_path = find_reusable_state_export(
-            assigned_state,
-            prefer_compressed=compress_file,
-        )
-
-        if reusable_path:
-            st.session_state.full_export_path = reusable_path
-            st.session_state.full_export_state = assigned_state
-            st.session_state.full_export_rows = load_state_unique_total(
-                assigned_state
+            self.send_error(
+                404,
+                "Export file not found."
             )
-            st.success(
-                "A recent export for this state was found and reused. "
-                "No new database export was required."
+
+            return
+
+
+        file_size = (
+            file_path.stat().st_size
+        )
+
+
+        # ====================================================
+        # RANGE DOWNLOAD SUPPORT
+        # ====================================================
+
+        range_header = (
+            self.headers.get(
+                "Range"
             )
+        )
+
+        start = 0
+        end = (
+            file_size - 1
+        )
+
+
+        if range_header:
+
+            match = re.match(
+                r"bytes=(\d*)-(\d*)",
+                range_header
+            )
+
+            if match:
+
+                if match.group(1):
+
+                    start = int(
+                        match.group(1)
+                    )
+
+
+                if match.group(2):
+
+                    end = int(
+                        match.group(2)
+                    )
+
+
+                if end >= file_size:
+
+                    end = (
+                        file_size - 1
+                    )
+
+
+                if start > end:
+
+                    self.send_error(
+                        416,
+                        "Requested Range Not Satisfiable"
+                    )
+
+                    return
+
+
+                self.send_response(
+                    206
+                )
+
+
+                self.send_header(
+                    "Content-Range",
+                    f"bytes {start}-{end}/{file_size}"
+                )
+
+            else:
+
+                self.send_response(
+                    200
+                )
+
         else:
-            prepare_new_export = True
 
-    if prepare_new_export:
+            self.send_response(
+                200
+            )
+
+
+        content_length = (
+            end - start + 1
+        )
+
+
+        self.send_header(
+            "Content-Type",
+            "application/gzip"
+        )
+
+        self.send_header(
+            "Content-Length",
+            str(
+                content_length
+            )
+        )
+
+        self.send_header(
+            "Accept-Ranges",
+            "bytes"
+        )
+
+        self.send_header(
+            "Cache-Control",
+            "private, no-store"
+        )
+
+        self.send_header(
+            "Content-Disposition",
+            (
+                f'attachment; '
+                f'filename="{filename}"'
+            )
+        )
+
+        self.end_headers()
+
+
         try:
-            with st.status(
-                "Preparing the state export...",
-                expanded=True,
-            ) as status:
-                st.write("Reading state records directly from PostgreSQL.")
-                st.write(
-                    "The export is not sorted, which avoids a costly "
-                    "multi-million-row database sort."
+
+            with open(
+                file_path,
+                "rb"
+            ) as file:
+
+                file.seek(
+                    start
                 )
 
-                export_path, estimated_rows = prepare_full_state_export(
-                    state_name=assigned_state,
-                    compress_file=compress_file,
+                remaining = (
+                    content_length
                 )
 
-                st.session_state.full_export_path = export_path
-                st.session_state.full_export_rows = estimated_rows
-                st.session_state.full_export_state = assigned_state
+                while remaining > 0:
 
-                status.update(
-                    label="Export prepared successfully.",
-                    state="complete",
-                    expanded=False,
+                    chunk = file.read(
+                        min(
+                            2 * 1024 * 1024,
+                            remaining
+                        )
+                    )
+
+                    if not chunk:
+                        break
+
+                    self.wfile.write(
+                        chunk
+                    )
+
+                    remaining -= len(
+                        chunk
+                    )
+
+
+        except (
+            BrokenPipeError,
+            ConnectionResetError
+        ):
+
+            pass
+
+
+# ============================================================
+# START DIRECT FILE SERVER
+# ============================================================
+
+@st.cache_resource
+def start_download_server():
+
+    try:
+
+        server = ThreadingHTTPServer(
+            (
+                DOWNLOAD_HOST,
+                DOWNLOAD_PORT
+            ),
+            ExportDownloadHandler
+        )
+
+        thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+            name="NCTO_Direct_Download_Server"
+        )
+
+        thread.start()
+
+        return server
+
+    except OSError:
+
+        # Port probably already active
+        return None
+
+
+start_download_server()
+
+
+def build_download_url(
+    filename
+):
+
+    token = create_download_token(
+        filename
+    )
+
+    return (
+        f"{PUBLIC_DOWNLOAD_BASE_URL}"
+        f"/download?"
+        f"token={quote(token)}"
+    )
+
+
+# ============================================================
+# SESSION INITIALIZATION
+# ============================================================
+
+if "logged_in" not in st.session_state:
+
+    st.session_state.logged_in = False
+
+
+# ============================================================
+# LOGIN PAGE
+# ============================================================
+
+if not st.session_state.logged_in:
+
+    st.title(
+        "🔐 NCTO State Officer Portal"
+    )
+
+    st.subheader(
+        "State Officer Login"
+    )
+
+    username = st.text_input(
+        "Username",
+        key="login_username"
+    )
+
+    password = st.text_input(
+        "Password",
+        type="password",
+        key="login_password"
+    )
+
+
+    if st.button(
+        "Login",
+        type="primary"
+    ):
+
+        try:
+
+            user = authenticate_user(
+                username.strip(),
+                password
+            )
+
+            if user:
+
+                st.session_state.logged_in = True
+
+                st.session_state.username = (
+                    user["username"]
+                )
+
+                st.session_state.state = (
+                    user["state"]
+                )
+
+                # Clear any previous user's detail result
+                st.session_state.pop(
+                    "beneficiary_details_df",
+                    None
+                )
+
+                st.rerun()
+
+            else:
+
+                st.error(
+                    "Invalid username or password."
                 )
 
         except Exception as exc:
-            st.error(f"Unable to prepare the full export: {exc}")
 
-    export_path = st.session_state.get("full_export_path")
-    export_state = st.session_state.get("full_export_state")
+            st.error(
+                f"Unable to login: {exc}"
+            )
 
-    if (
-        export_path
-        and export_state == assigned_state
-        and Path(export_path).exists()
-    ):
-        file_path = Path(export_path)
-        file_size = file_path.stat().st_size
-        estimated_rows = int(
-            st.session_state.get("full_export_rows") or 0
-        )
 
-        st.success("The export is ready for download.")
-
-        info1, info2, info3 = st.columns(3)
-        info1.metric(
-            "Estimated Unique Beneficiaries",
-            f"{estimated_rows:,}",
-        )
-        info2.metric(
-            "Prepared File Size",
-            format_file_size(file_size),
-        )
-        info3.metric(
-            "File Type",
-            "CSV.GZ" if file_path.suffix == ".gz" else "CSV",
-        )
-
-        st.warning(
-            "Keep this page open until the browser confirms that the "
-            "download has started. Do not click the download button repeatedly."
-        )
-
-        st.download_button(
-            label=f"Download {file_path.name}",
-            data=deferred_export_reader(str(file_path)),
-            file_name=file_path.name,
-            mime=(
-                "application/gzip"
-                if file_path.suffix == ".gz"
-                else "text/csv"
-            ),
-            on_click="ignore",
-            type="primary",
-            width="stretch",
-            key=f"remote_download_{file_path.name}",
-        )
-
-        st.caption(
-            "Prepared exports are temporary and may disappear when the "
-            "Render service restarts or redeploys."
-        )
+    st.stop()
 
 
 # ============================================================
-# 12. APPLICATION ENTRY POINT
+# LOGGED IN USER
 # ============================================================
 
-def main() -> None:
-    """Run the optimized State Officer Portal."""
-    cleanup_old_export_files()
+assigned_state = str(
+    st.session_state.state
+).strip()
 
-    cookie_manager = initialize_session_state()
-    restore_session_from_cookies(cookie_manager)
+logged_username = (
+    st.session_state.username
+)
 
-    if not st.session_state.logged_in:
-        render_login_page(cookie_manager)
 
-    assigned_state = st.session_state.assigned_state
+# ============================================================
+# SIDEBAR
+# ============================================================
 
-    if not assigned_state:
-        st.error("The logged-in account has no assigned state.")
-        logout(cookie_manager)
-        st.stop()
+st.sidebar.title(
+    "NCTO State Portal"
+)
 
-    selected_page = render_sidebar(
-        cookie_manager=cookie_manager,
-        assigned_state=assigned_state,
+st.sidebar.success(
+    f"User: {logged_username}"
+)
+
+st.sidebar.info(
+    f"State: {assigned_state}"
+)
+
+
+menu = st.sidebar.radio(
+    "Navigation",
+    [
+        "State Summary",
+        "LGA Summary",
+        "Beneficiary Details",
+        "Full State Export"
+    ],
+    key="main_navigation"
+)
+
+
+st.sidebar.divider()
+
+
+if st.sidebar.button(
+    "Logout"
+):
+
+    st.session_state.clear()
+
+    st.rerun()
+
+
+# ============================================================
+# MAIN HEADER
+# ============================================================
+
+st.title(
+    "NCTO State Officer Payment Data Portal"
+)
+
+st.caption(
+    f"Assigned State: {assigned_state}"
+)
+
+
+# ============================================================
+# PAGE 1 — STATE SUMMARY
+# ============================================================
+
+if menu == "State Summary":
+
+    st.header(
+        "State Summary"
     )
 
-    if selected_page == "Home":
-        render_home_page(assigned_state)
 
-    elif selected_page == "State Summary":
-        render_state_summary_page(assigned_state)
+    try:
 
-    elif selected_page == "LGA Summary":
-        render_lga_summary_page(assigned_state)
+        with st.spinner(
+            "Loading state summary..."
+        ):
 
-    elif selected_page == "Beneficiary Search":
-        render_search_page(assigned_state)
+            summary_df = load_state_summary(
+                assigned_state
+            )
 
-    elif selected_page == "Full Details Export":
-        render_full_export_page(assigned_state)
+            unique_total = load_state_unique_total(
+                assigned_state
+            )
 
 
-if __name__ == "__main__":
-    main()
+        c1, c2, c3 = st.columns(
+            3
+        )
+
+
+        c1.metric(
+            "Total Beneficiaries",
+            f"{unique_total:,}"
+        )
+
+
+        c2.metric(
+            "Total Households",
+            f"{unique_total:,}"
+        )
+
+
+        tranche_count = (
+            summary_df[
+                "tranche"
+            ].nunique()
+            if not summary_df.empty
+            else 0
+        )
+
+
+        c3.metric(
+            "Tranches Available",
+            f"{tranche_count:,}"
+        )
+
+
+        if summary_df.empty:
+
+            st.warning(
+                "No state summary found."
+            )
+
+        else:
+
+            st.dataframe(
+                summary_df,
+                use_container_width=True,
+                hide_index=True
+            )
+
+
+            state_summary_excel = (
+                dataframe_to_excel_bytes(
+                    summary_df,
+                    "State Summary"
+                )
+            )
+
+
+            st.download_button(
+                label="Download State Summary",
+                data=state_summary_excel,
+                file_name=(
+                    f"{safe_filename(assigned_state)}"
+                    "_State_Summary.xlsx"
+                ),
+                mime=(
+                    "application/vnd.openxmlformats-"
+                    "officedocument.spreadsheetml.sheet"
+                ),
+                key="state_summary_download"
+            )
+
+
+    except Exception as exc:
+
+        st.error(
+            f"Unable to load state summary: {exc}"
+        )
+
+
+# ============================================================
+# PAGE 2 — LGA SUMMARY
+# ============================================================
+
+elif menu == "LGA Summary":
+
+    st.header(
+        "LGA Summary"
+    )
+
+
+    try:
+
+        with st.spinner(
+            "Loading LGA summary..."
+        ):
+
+            lga_df = load_lga_summary(
+                assigned_state
+            )
+
+
+        if lga_df.empty:
+
+            st.warning(
+                "No LGA summary found."
+            )
+
+        else:
+
+            st.success(
+                f"{len(lga_df):,} LGAs found."
+            )
+
+
+            st.dataframe(
+                lga_df,
+                use_container_width=True,
+                hide_index=True,
+                height=600
+            )
+
+
+            lga_summary_excel = (
+                dataframe_to_excel_bytes(
+                    lga_df,
+                    "LGA Summary"
+                )
+            )
+
+
+            st.download_button(
+                label="Download LGA Summary",
+                data=lga_summary_excel,
+                file_name=(
+                    f"{safe_filename(assigned_state)}"
+                    "_LGA_Summary.xlsx"
+                ),
+                mime=(
+                    "application/vnd.openxmlformats-"
+                    "officedocument.spreadsheetml.sheet"
+                ),
+                key="lga_summary_download"
+            )
+
+
+    except Exception as exc:
+
+        st.error(
+            f"Unable to load LGA summary: {exc}"
+        )
+
+
+# ============================================================
+# PAGE 3 — BENEFICIARY DETAILS
+# ============================================================
+
+elif menu == "Beneficiary Details":
+
+    st.header(
+        "Beneficiary Details"
+    )
+
+    st.caption(
+        "Search beneficiary payment records for your assigned state."
+    )
+
+
+    col1, col2, col3 = st.columns(
+        [1, 2, 1]
+    )
+
+
+    with col1:
+
+        tranche_filter = st.selectbox(
+            "Tranche",
+            [
+                "All",
+                "First Tranche",
+                "Second Tranche",
+                "Third Tranche"
+            ],
+            key="detail_tranche"
+        )
+
+
+    with col2:
+
+        search_value = st.text_input(
+            "Search",
+            placeholder=(
+                "NID, NIDHH, Name, Telephone, "
+                "Account Number or Household ID"
+            ),
+            key="detail_search"
+        )
+
+
+    with col3:
+
+        limit_rows = st.number_input(
+            "Maximum Rows",
+            min_value=1000,
+            max_value=200000,
+            value=50000,
+            step=10000,
+            key="detail_limit"
+        )
+
+
+    if st.button(
+        "Load Beneficiary Details",
+        type="primary",
+        key="load_beneficiary_details"
+    ):
+
+        try:
+
+            with st.spinner(
+                "Loading beneficiary records..."
+            ):
+
+                details_df = load_state_data(
+                    assigned_state,
+                    tranche_filter,
+                    search_value.strip(),
+                    limit_rows
+                )
+
+
+            st.session_state[
+                "beneficiary_details_df"
+            ] = details_df
+
+
+        except Exception as exc:
+
+            st.error(
+                f"Unable to load beneficiary details: {exc}"
+            )
+
+
+    if (
+        "beneficiary_details_df"
+        in st.session_state
+    ):
+
+        details_df = st.session_state[
+            "beneficiary_details_df"
+        ]
+
+
+        if details_df.empty:
+
+            st.warning(
+                "No matching records found."
+            )
+
+        else:
+
+            st.success(
+                f"{len(details_df):,} records loaded."
+            )
+
+
+            st.dataframe(
+                details_df,
+                use_container_width=True,
+                hide_index=True,
+                height=600
+            )
+
+
+            csv_data = dataframe_to_csv_bytes(
+                details_df
+            )
+
+
+            st.download_button(
+                label="Download Loaded Details as CSV",
+                data=csv_data,
+                file_name=(
+                    f"{safe_filename(assigned_state)}"
+                    "_Beneficiary_Details.csv"
+                ),
+                mime="text/csv",
+                key="filtered_csv_download"
+            )
+
+
+# ============================================================
+# PAGE 4 — FULL STATE EXPORT
+# ============================================================
+
+elif menu == "Full State Export":
+
+    st.header(
+        "Full State Beneficiary Export"
+    )
+
+
+    st.info(
+        "This option is designed for very large datasets. "
+        "The export runs in the background using PostgreSQL COPY, "
+        "is compressed as CSV.GZ, validated, and then downloaded "
+        "directly from the file server."
+    )
+
+
+    col1, col2 = st.columns(
+        2
+    )
+
+
+    with col1:
+
+        if st.button(
+            "Prepare Full State Export",
+            type="primary",
+            use_container_width=True,
+            key="prepare_full_export"
+        ):
+
+            try:
+
+                started, message = (
+                    start_full_export(
+                        assigned_state
+                    )
+                )
+
+
+                if started:
+
+                    st.success(
+                        "Export started successfully."
+                    )
+
+                    st.info(
+                        "You may leave this section and continue "
+                        "using the portal. Return later and click "
+                        "'Check Export Status'."
+                    )
+
+                else:
+
+                    st.info(
+                        message
+                    )
+
+
+            except Exception as exc:
+
+                st.error(
+                    f"Unable to start export: {exc}"
+                )
+
+
+    with col2:
+
+        if st.button(
+            "Check Export Status",
+            use_container_width=True,
+            key="check_export_status"
+        ):
+
+            st.rerun()
+
+
+    st.divider()
+
+
+    export_status = read_export_status(
+        assigned_state
+    )
+
+
+    if not export_status:
+
+        st.info(
+            "No full-state export has been prepared yet."
+        )
+
+
+    else:
+
+        current_status = export_status.get(
+            "status"
+        )
+
+
+        # ----------------------------------------------------
+        # RUNNING
+        # ----------------------------------------------------
+
+        if current_status == "running":
+
+            st.warning(
+                "The full state export is currently being prepared."
+            )
+
+
+            started_at = export_status.get(
+                "started_at"
+            )
+
+
+            if started_at:
+
+                st.write(
+                    f"Started: {started_at}"
+                )
+
+
+            st.caption(
+                "You do not need to keep this page open."
+            )
+
+
+        # ----------------------------------------------------
+        # FAILED
+        # ----------------------------------------------------
+
+        elif current_status == "failed":
+
+            st.error(
+                "The full state export failed."
+            )
+
+
+            st.code(
+                export_status.get(
+                    "error",
+                    "Unknown export error."
+                )
+            )
+
+
+        # ----------------------------------------------------
+        # READY
+        # ----------------------------------------------------
+
+        elif current_status == "ready":
+
+            filepath = export_status.get(
+                "filepath"
+            )
+
+
+            export_file = (
+                Path(
+                    filepath
+                )
+                if filepath
+                else None
+            )
+
+
+            if (
+                export_file is not None
+                and export_file.exists()
+                and export_file.stat().st_size > 0
+            ):
+
+                size_mb = (
+                    export_file.stat().st_size
+                    / 1024
+                    / 1024
+                )
+
+
+                info1, info2 = st.columns(
+                    2
+                )
+
+
+                info1.metric(
+                    "Status",
+                    "READY"
+                )
+
+
+                info2.metric(
+                    "Compressed File Size",
+                    f"{size_mb:,.1f} MB"
+                )
+
+
+                completed_at = export_status.get(
+                    "completed_at"
+                )
+
+
+                if completed_at:
+
+                    st.caption(
+                        f"Completed: {completed_at}"
+                    )
+
+
+                direct_url = build_download_url(
+                    export_file.name
+                )
+
+
+                st.link_button(
+                    "⬇ Download Full State Export",
+                    direct_url,
+                    type="primary",
+                    use_container_width=True
+                )
+
+
+                st.caption(
+                    "The file downloads directly through the browser "
+                    "and does not pass through Streamlit memory."
+                )
+
+
+                st.caption(
+                    "The downloaded file is a compressed CSV (.csv.gz). "
+                    "Extract it using 7-Zip, WinRAR or another GZIP-compatible tool."
+                )
+
+
+            else:
+
+                st.error(
+                    "The export status says READY, but the completed "
+                    "file cannot be found. Generate a new export."
+                )
